@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(nvidia-smi 2>$null)"
+    ]
+  }
+}
