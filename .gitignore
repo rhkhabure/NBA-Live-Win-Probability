@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+venv/
+.venv/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Large data files — do NOT push raw PBP parquets or tensor files
+nba_win_prob/raw/
+nba_win_prob/processed/
+
+# DO commit these model artefacts (small, needed for Cloud inference):
+# nba_win_prob/model/win_prob_net.pth
+# nba_win_prob/model/scaler.pkl
+# nba_win_prob/model/temperature.json
+# nba_win_prob/model/elo_ratings.json
+# nba_win_prob/model/training_history.json
+
+# Plots are optional — comment out to include them
+# nba_win_prob/plots/
+
+# OS
+.DS_Store
+Thumbs.db
