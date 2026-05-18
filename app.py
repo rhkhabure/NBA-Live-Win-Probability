@@ -292,24 +292,169 @@ def p_home_wins_game_from_elo(home_elo: float, away_elo: float,
 
 @st.cache_data(ttl=30, show_spinner=False)
 def fetch_live_games() -> list:
+    """
+    Multi-fallback live game fetcher.
+
+    Attempt order:
+      1. Direct HTTPS request to NBA CDN with correct browser headers
+         (bypasses nba_api wrapper which can cache stale empty responses)
+      2. nba_api ScoreBoard() wrapper — catches cases where CDN redirect changes
+      3. nba_api ScoreboardV3 stats endpoint — different base URL, often works
+         when CDN is stale
+    Returns a list of game dicts, empty list if all attempts fail.
+    """
+    import requests as _req
+    import datetime as _dt
+
+    # ── Attempt 1: Direct CDN request with full browser headers ───────────
+    _NBA_HEADERS = {
+        "Accept":          "application/json, text/plain, */*",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control":   "no-cache",
+        "Connection":      "keep-alive",
+        "Host":            "cdn.nba.com",
+        "Origin":          "https://www.nba.com",
+        "Pragma":          "no-cache",
+        "Referer":         "https://www.nba.com/",
+        "Sec-Fetch-Dest":  "empty",
+        "Sec-Fetch-Mode":  "cors",
+        "Sec-Fetch-Site":  "same-site",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+    }
+    _CDN_URL = "https://cdn.nba.com/static/json/liveData/scoreboard/todaysScoreboard_00.json"
+
+    try:
+        resp = _req.get(_CDN_URL, headers=_NBA_HEADERS, timeout=10)
+        if resp.status_code == 200:
+            data  = resp.json()
+            games = data.get("scoreboard", {}).get("games", [])
+            if isinstance(games, list) and len(games) > 0:
+                return games
+    except Exception:
+        pass
+
+    # ── Attempt 2: nba_api live ScoreBoard wrapper ─────────────────────────
     try:
         board = live_sb.ScoreBoard()
         games = board.games.get_dict()
-        return games if isinstance(games, list) else []
-    except Exception as e:
-        # nba_api returns empty body when no games today ("Expecting value: line 1")
-        # or when the NBA CDN is momentarily unavailable — both are safe to swallow
-        return []
+        if isinstance(games, list) and len(games) > 0:
+            return games
+    except Exception:
+        pass
+
+    # ── Attempt 3: Stats ScoreboardV3 (different base URL) ────────────────
+    try:
+        from nba_api.stats.endpoints import scoreboardv3
+        today_str = _dt.date.today().strftime("%m/%d/%Y")
+        sb3   = scoreboardv3.ScoreboardV3(game_date=today_str, timeout=15)
+        dfs   = sb3.get_data_frames()
+        # ScoreboardV3 df[0] = GameHeader — convert to live-style dicts
+        header_df = dfs[0] if dfs else None
+        linescore_df = dfs[1] if len(dfs) > 1 else None
+        if header_df is not None and not header_df.empty:
+            games = []
+            for _, row in header_df.iterrows():
+                gid = str(row.get("GAME_ID", ""))
+                # Find home/away line scores
+                ht_row = {}; at_row = {}
+                if linescore_df is not None:
+                    gls = linescore_df[linescore_df["GAME_ID"] == gid]
+                    for _, lr in gls.iterrows():
+                        if lr.get("TEAM_ID") == row.get("HOME_TEAM_ID"):
+                            ht_row = lr.to_dict()
+                        else:
+                            at_row = lr.to_dict()
+
+                # Map to live-style schema
+                status_text = str(row.get("GAME_STATUS_TEXT", ""))
+                game_status = 3 if "Final" in status_text else (
+                              2 if any(q in status_text for q in ["Q","Ht","OT","End"]) else 1)
+                games.append({
+                    "gameId":         gid,
+                    "gameStatus":     game_status,
+                    "gameStatusText": status_text,
+                    "period":         int(row.get("LIVE_PERIOD", 0) or 0),
+                    "gameClock":      str(row.get("LIVE_PC_TIME", "") or ""),
+                    "homeTeam": {
+                        "teamId":       int(row.get("HOME_TEAM_ID", 0) or 0),
+                        "teamTricode":  str(ht_row.get("TEAM_ABBREVIATION", "") or ""),
+                        "teamCity":     str(ht_row.get("TEAM_CITY_NAME", "") or ""),
+                        "teamName":     str(ht_row.get("TEAM_NAME", "") or ""),
+                        "score":        int(ht_row.get("PTS", 0) or 0),
+                        "wins":         int(row.get("HOME_TEAM_WINS", 0) or 0),
+                        "losses":       int(row.get("HOME_TEAM_LOSSES", 0) or 0),
+                    },
+                    "awayTeam": {
+                        "teamId":       int(row.get("VISITOR_TEAM_ID", 0) or 0),
+                        "teamTricode":  str(at_row.get("TEAM_ABBREVIATION", "") or ""),
+                        "teamCity":     str(at_row.get("TEAM_CITY_NAME", "") or ""),
+                        "teamName":     str(at_row.get("TEAM_NAME", "") or ""),
+                        "score":        int(at_row.get("PTS", 0) or 0),
+                        "wins":         int(row.get("VISITOR_TEAM_WINS", 0) or 0),
+                        "losses":       int(row.get("VISITOR_TEAM_LOSSES", 0) or 0),
+                    },
+                })
+            if games:
+                return games
+    except Exception:
+        pass
+
+    return []   # all attempts failed
 
 
 @st.cache_data(ttl=20, show_spinner=False)
 def fetch_pbp(game_id: str) -> list:
+    """
+    Multi-fallback play-by-play fetcher.
+    Attempt 1: Direct CDN request
+    Attempt 2: nba_api PlayByPlay wrapper
+    """
+    import requests as _req
+
+    _NBA_HEADERS = {
+        "Accept":          "application/json, text/plain, */*",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control":   "no-cache",
+        "Connection":      "keep-alive",
+        "Host":            "cdn.nba.com",
+        "Origin":          "https://www.nba.com",
+        "Pragma":          "no-cache",
+        "Referer":         "https://www.nba.com/",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+    }
+
+    # Attempt 1: Direct CDN
     try:
-        pbp = live_pbp.PlayByPlay(game_id)
-        actions = pbp.actions.get_dict()
-        return actions if isinstance(actions, list) else []
+        url  = f"https://cdn.nba.com/static/json/liveData/playbyplay/playbyplay_{game_id}.json"
+        resp = _req.get(url, headers=_NBA_HEADERS, timeout=10)
+        if resp.status_code == 200:
+            data    = resp.json()
+            actions = data.get("game", {}).get("actions", [])
+            if isinstance(actions, list):
+                return actions
     except Exception:
-        return []
+        pass
+
+    # Attempt 2: nba_api wrapper
+    try:
+        pbp     = live_pbp.PlayByPlay(game_id)
+        actions = pbp.actions.get_dict()
+        if isinstance(actions, list):
+            return actions
+    except Exception:
+        pass
+
+    return []
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -485,8 +630,8 @@ def gauge_chart(prob: float, home_code: str, away_code: str,
         title=dict(text=f"<b>{home_code}</b> win prob", font=dict(size=14, color="#8b949e")),
     ))
     fig.update_layout(
-        **PLOTLY_BASE, height=250,
-        margin=dict(l=20, r=20, t=30, b=10),
+        **{**PLOTLY_BASE, "margin": dict(l=20, r=20, t=30, b=10)},
+        height=250,
     )
     return fig
 
@@ -609,6 +754,38 @@ def main():
         st.markdown("---")
         last_refresh = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
         st.caption(f"Last refresh: {last_refresh}")
+        st.markdown("---")
+        with st.expander("🔧 API Debug"):
+            if st.button("Test Live API", use_container_width=True):
+                import requests as _req
+                _headers = {
+                    "Accept": "application/json, text/plain, */*",
+                    "Cache-Control": "no-cache",
+                    "Origin": "https://www.nba.com",
+                    "Referer": "https://www.nba.com/",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                }
+                _url = "https://cdn.nba.com/static/json/liveData/scoreboard/todaysScoreboard_00.json"
+                try:
+                    r = _req.get(_url, headers=_headers, timeout=10)
+                    st.caption(f"CDN status: {r.status_code}")
+                    if r.status_code == 200:
+                        d = r.json()
+                        gs = d.get("scoreboard", {}).get("games", [])
+                        st.caption(f"Games in CDN response: {len(gs)}")
+                        for g in gs:
+                            st.caption(f"  {g['awayTeam']['teamTricode']} @ {g['homeTeam']['teamTricode']} — status {g['gameStatus']}")
+                    else:
+                        st.caption(f"CDN body: {r.text[:200]}")
+                except Exception as e:
+                    st.caption(f"CDN error: {e}")
+
+                try:
+                    board = live_sb.ScoreBoard()
+                    gms = board.games.get_dict()
+                    st.caption(f"nba_api live wrapper: {len(gms) if gms else 0} games")
+                except Exception as e:
+                    st.caption(f"nba_api live error: {e}")
 
         if st.button("🔄 Refresh Now", use_container_width=True):
             st.cache_data.clear()
