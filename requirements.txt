@@ -1,14 +1,10 @@
-# CPU-only PyTorch — Streamlit Cloud has no GPU.
-# The model runs on CPU in cloud deployment; RTX 4060 used for local dev only.
---extra-index-url https://download.pytorch.org/whl/cpu
-
-torch==2.6.0+cpu
-numpy==1.26.4
-pandas==2.2.2
-scikit-learn==1.5.0
-scipy==1.13.1
-nba_api==1.9.1
-streamlit==1.35.0
-plotly==5.22.0
-pyarrow==16.1.0
-requests==2.32.3
+torch
+numpy
+pandas
+scikit-learn
+scipy
+nba_api
+streamlit
+plotly
+pyarrow
+requests
