@@ -229,8 +229,18 @@ def predict_win_prob(
     is_playoffs: int,
     lead_changes: int, plays: int,
     model, scaler, T, device,
+    momentum: float = 0.0,
 ) -> float:
-    """Return calibrated P(home team wins) for a single game state."""
+    """
+    Return calibrated P(home team wins) for a single game state.
+
+    Phase 4 fixes applied:
+      FIX 1: Elo time-decay — Elo influence decays linearly from full weight at
+             tip-off (t=2880s) to a 5% residual at the final buzzer. In OT the
+             decay is fixed at 5% since the score is effectively tied.
+      FIX 3: Momentum nudge — a small post-hoc logit adjustment proportional to
+             rolling scoring momentum (bounded to +-0.20 logit units).
+    """
     clock_sec  = parse_clock(clock)
     t_rem      = time_remaining(period, clock_sec)
     period_dur = 720.0 if period <= 4 else 300.0
@@ -238,9 +248,24 @@ def predict_win_prob(
     score_diff = float(np.clip(home_score - away_score, -80, 80))
     n_plays    = max(1, plays)
 
+    # ── FIX 1: Elo time-decay ─────────────────────────────────────────────
+    REG_SECONDS = 2880.0
+    ELO_MIN     = 0.05   # 5% residual — pre-game quality still matters a little
+    if period <= 4:
+        elo_decay = float(np.clip(
+            ELO_MIN + (1.0 - ELO_MIN) * (t_rem / REG_SECONDS),
+            ELO_MIN, 1.0
+        ))
+    else:
+        elo_decay = ELO_MIN   # OT: game is tied — Elo contribution near-zero
+
+    home_elo_d = 1500.0 + (home_elo - 1500.0) * elo_decay
+    away_elo_d = 1500.0 + (away_elo - 1500.0) * elo_decay
+    elo_diff_d = home_elo_d - away_elo_d
+
     raw = np.array([[
         score_diff, t_rem, float(period), q_elapsed,
-        home_elo, away_elo, home_elo - away_elo,
+        home_elo_d, away_elo_d, elo_diff_d,
         float(home_sw), float(away_sw),
         float(is_playoffs), float(period > 4),
         lead_changes / n_plays,
@@ -251,7 +276,13 @@ def predict_win_prob(
 
     with torch.no_grad():
         logit = model.logits(tensor).item()
-    prob = 1 / (1 + np.exp(-logit / T))   # temperature-scaled
+
+    # ── FIX 3: Momentum post-hoc logit nudge ──────────────────────────────
+    # momentum in [-1, +1]: +1 = home scoring everything in recent plays
+    # 0.18 weight → max +-0.18 logit shift = +-4.5pp near p=0.50
+    logit = logit + float(np.clip(0.18 * momentum, -0.20, 0.20))
+
+    prob = 1 / (1 + np.exp(-logit / T))
     return float(np.clip(prob, 0.001, 0.999))
 
 
@@ -466,14 +497,26 @@ def build_game_history(actions: list, home_elo: float, away_elo: float,
                        model, scaler, T, device) -> pd.DataFrame:
     """
     Walk through all play-by-play actions and compute win prob at each scored play.
-    Returns DataFrame with columns: action_num, period, clock_sec, time_remaining,
-    home_score, away_score, score_diff, home_win_prob, description.
+
+    Phase 4 fixes applied:
+      FIX 3: Tracks rolling momentum over the last MOMENTUM_WINDOW scored plays.
+             momentum = (home_pts_recent - away_pts_recent) / MOMENTUM_SCALE
+             Normalised to [-1, +1] before passing to predict_win_prob.
     """
-    rows = []
+    from collections import deque
+
+    MOMENTUM_WINDOW = 12      # scored plays (~3-4 minutes of basketball)
+    MOMENTUM_SCALE  = 15.0    # normalise: 15pt differential = momentum +-1.0
+
+    rows         = []
     lead_changes = 0
     prev_lead    = 0
     play_num     = 0
     prev_hs = prev_as = 0
+
+    # Deques store (home_pts_gained, away_pts_gained) per play
+    home_recent = deque(maxlen=MOMENTUM_WINDOW)
+    away_recent = deque(maxlen=MOMENTUM_WINDOW)
 
     for act in actions:
         hs_str = act.get("scoreHome", "") or ""
@@ -486,10 +529,27 @@ def build_game_history(actions: list, home_elo: float, away_elo: float,
             continue
 
         play_num += 1
-        period = int(act.get("period", 1))
-        clock  = act.get("clock", "PT12M00.00S")
+        period    = int(act.get("period", 1))
+        clock     = act.get("clock", "PT12M00.00S")
         clock_sec = parse_clock(clock)
 
+        # ── Track points scored on this play ──────────────────────────────
+        h_pts_this = max(0, hs  - prev_hs)
+        a_pts_this = max(0, as_ - prev_as)
+        home_recent.append(h_pts_this)
+        away_recent.append(a_pts_this)
+        prev_hs, prev_as = hs, as_
+
+        # ── Momentum: normalised rolling pts differential ──────────────────
+        if len(home_recent) >= 3:   # need at least 3 plays to be meaningful
+            momentum = float(np.clip(
+                (sum(home_recent) - sum(away_recent)) / MOMENTUM_SCALE,
+                -1.0, 1.0
+            ))
+        else:
+            momentum = 0.0
+
+        # ── Lead change tracking ───────────────────────────────────────────
         cur_lead = np.sign(hs - as_)
         if cur_lead != prev_lead and cur_lead != 0:
             lead_changes += 1
@@ -503,6 +563,7 @@ def build_game_history(actions: list, home_elo: float, away_elo: float,
             is_playoffs=is_playoffs,
             lead_changes=lead_changes, plays=play_num,
             model=model, scaler=scaler, T=T, device=device,
+            momentum=momentum,
         )
 
         t_rem = time_remaining(period, clock_sec)
@@ -514,6 +575,7 @@ def build_game_history(actions: list, home_elo: float, away_elo: float,
             "home_score"     : hs,
             "away_score"     : as_,
             "score_diff"     : hs - as_,
+            "momentum"       : round(momentum, 3),
             "home_win_prob"  : prob,
             "away_win_prob"  : 1 - prob,
             "description"    : act.get("description", ""),
@@ -669,50 +731,122 @@ def bracket_chart(teams_probs: dict) -> go.Figure:
 def compute_finals_probs(live_games: list, elo_ratings: dict,
                           series_states: dict) -> dict:
     """
-    Estimate P(each team wins NBA Finals) by simulating all remaining series.
+    Estimate P(each team wins NBA Finals) using a two-stage bracket simulation.
 
-    series_states : { 'CONF-SERIES-KEY': {'home':CODE,'away':CODE,'hw':int,'aw':int} }
-    Returns        : { TEAM_CODE: probability }
+    Phase 4 FIX 2: Uses live SERIES wins/losses (not just Elo) so that a team
+    which has lost games in their current series is properly penalised.
+
+    Stage 1 — Current series: P(team advances) via Monte Carlo from live series state.
+    Stage 2 — Remaining bracket: chain Elo-based series simulations to Finals.
+
+    Returns { TEAM_CODE: P(wins Finals) }.
     """
     try:
-        # Gather all active playoff series from live game data
-        conf_finals = {}
-        finals_data = {}
+        if not live_games:
+            return {}
+
+        # ── Stage 1: Gather current series state from live scoreboard ─────
+        series_map = {}   # key=(sorted tricodes) → series dict with LIVE wins
 
         for g in live_games:
             ht = g["homeTeam"]["teamTricode"]
             at = g["awayTeam"]["teamTricode"]
-            hw = g["homeTeam"].get("wins", 0)
-            aw = g["awayTeam"].get("wins", 0)
-            gid = g.get("gameId", "")
+            if not ht or not at:
+                continue
 
-            # Identify round by wins (rough heuristic: if game 1 of series, check series wins)
-            # For simplicity, track all playoff series
+            # wins/losses on the scoreboard are SERIES wins (not season record)
+            # in playoff games
+            hw = int(g["homeTeam"].get("wins", 0) or 0)
+            aw = int(g["awayTeam"].get("wins", 0) or 0)
             key = tuple(sorted([ht, at]))
-            if key not in conf_finals:
-                conf_finals[key] = {"home": ht, "away": at, "hw": hw, "aw": aw}
 
-        if not conf_finals:
+            # Only store once per series (first game dict encountered)
+            if key not in series_map:
+                series_map[key] = {
+                    "home": ht, "away": at,
+                    "hw": hw,   "aw":  aw,
+                }
+
+        if not series_map:
             return {}
 
-        # Simulate each remaining series
-        team_finals_prob = {}
-        series_list = list(conf_finals.values())
+        # ── Stage 2: Simulate each series from current state ──────────────
+        # P(home wins series) using live hw/aw + Elo per-game probability
+        team_series_prob = {}
 
-        for series in series_list:
-            ht = series["home"]; at = series["away"]
+        for key, series in series_map.items():
+            ht, at = series["home"], series["away"]
+            hw, aw = series["hw"],   series["aw"]
+
             h_elo = elo_ratings.get(ht, 1500)
             a_elo = elo_ratings.get(at, 1500)
-            p_home_game = p_home_wins_game_from_elo(h_elo, a_elo)
-            p_home_series = simulate_series(p_home_game, series["hw"], series["aw"],
-                                             n_sims=50_000)
-            team_finals_prob[ht] = team_finals_prob.get(ht, 0) + p_home_series
-            team_finals_prob[at] = team_finals_prob.get(at, 0) + (1 - p_home_series)
 
-        # Normalise so values represent rough Finals win probability
-        # (simplified: just P of winning their current series, not full bracket)
+            # Per-game probability from Elo (home court advantage included)
+            p_home_game = p_home_wins_game_from_elo(h_elo, a_elo)
+
+            # Simulate REMAINING games from current series state (hw, aw)
+            p_home_series = simulate_series(p_home_game, hw, aw, n_sims=50_000)
+            p_away_series = 1.0 - p_home_series
+
+            team_series_prob[ht] = team_series_prob.get(ht, 0.0) + p_home_series
+            team_series_prob[at] = team_series_prob.get(at, 0.0) + p_away_series
+
+        # ── Stage 3: Chain to Finals probability ──────────────────────────
+        # For each pair of teams that could meet in the Finals, compute
+        # P(A wins Finals) = P(A advances) * P(A beats B | both advance)
+        # Simplified: if we have exactly 2 active series (Conference Finals),
+        # the Finals winner is the product of winning their series then the Finals.
+        teams = list(team_series_prob.keys())
+        finals_prob = {}
+
+        if len(teams) == 2:
+            # Two teams left — they ARE the finalists already
+            for t in teams:
+                finals_prob[t] = round(team_series_prob[t], 4)
+        elif len(teams) >= 4:
+            # Conference Finals stage: pair teams by conference
+            # Sort series by Elo to identify likely finalists
+            series_list = sorted(
+                series_map.values(),
+                key=lambda s: elo_ratings.get(s["home"], 1500) +
+                              elo_ratings.get(s["away"], 1500),
+                reverse=True
+            )
+            # Each series produces one finalist — simulate who wins the Finals
+            if len(series_list) >= 2:
+                s1, s2 = series_list[0], series_list[1]
+                # Finalist from series 1
+                ht1, at1 = s1["home"], s1["away"]
+                p_h1 = team_series_prob.get(ht1, 0.5)
+                p_a1 = team_series_prob.get(at1, 0.5)
+
+                # Finalist from series 2
+                ht2, at2 = s2["home"], s2["away"]
+                p_h2 = team_series_prob.get(ht2, 0.5)
+                p_a2 = team_series_prob.get(at2, 0.5)
+
+                # Four possible Finals matchups
+                for t1, p_t1 in [(ht1, p_h1), (at1, p_a1)]:
+                    for t2, p_t2 in [(ht2, p_h2), (at2, p_a2)]:
+                        e1 = elo_ratings.get(t1, 1500)
+                        e2 = elo_ratings.get(t2, 1500)
+                        # Neutral court Finals (no home advantage)
+                        p_t1_wins_finals = 1 / (1 + 10**((e2 - e1) / 400))
+                        p_finals_series_t1 = simulate_series(
+                            p_t1_wins_finals, 0, 0, n_sims=30_000
+                        )
+                        finals_prob[t1] = finals_prob.get(t1, 0.0) + (
+                            p_t1 * p_t2 * p_finals_series_t1)
+                        finals_prob[t2] = finals_prob.get(t2, 0.0) + (
+                            p_t1 * p_t2 * (1.0 - p_finals_series_t1))
+            else:
+                finals_prob = {t: round(v, 4) for t, v in team_series_prob.items()}
+        else:
+            finals_prob = {t: round(v, 4) for t, v in team_series_prob.items()}
+
         return {k: round(v, 4) for k, v in
-                sorted(team_finals_prob.items(), key=lambda x: x[1], reverse=True)}
+                sorted(finals_prob.items(), key=lambda x: x[1], reverse=True)
+                if v > 0.001}
 
     except Exception:
         return {}
@@ -743,6 +877,10 @@ def main():
         st.caption(f"AUC: {0.8539:.4f} · Brier: {0.1560:.4f}")
         st.caption(f"Temperature T: {T:.4f}")
         st.caption(f"Device: {str(device).upper()}")
+        st.markdown("**Phase 4 Active**")
+        st.caption("✅ Elo time-decay (5% floor)")
+        st.caption("✅ Momentum window (12 plays)")
+        st.caption("✅ Finals: live series wins")
         st.markdown("---")
 
         show_bracket = st.toggle("Show Finals Probability", value=True)
@@ -1014,11 +1152,22 @@ def main():
     # ── PLAY-BY-PLAY TABLE ─────────────────────────────────────────────────
     if show_history and not hist.empty:
         st.markdown("<div class='section-header'>PLAY LOG</div>", unsafe_allow_html=True)
-        display = hist[["clock_display","home_score","away_score",
-                         "score_diff","home_win_prob","description"]].copy()
-        display.columns = ["Clock","Home","Away","Diff","Home Win %","Last Play"]
-        display["Home Win %"] = display["Home Win %"].map("{:.1%}".format)
-        display["Diff"]       = display["Diff"].map(lambda x: f"+{x}" if x > 0 else str(x))
+        cols_to_show = ["clock_display","home_score","away_score",
+                        "score_diff","momentum","home_win_prob","description"]
+        cols_to_show = [c for c in cols_to_show if c in hist.columns]
+        display = hist[cols_to_show].copy()
+        col_rename = {
+            "clock_display": "Clock", "home_score": "Home", "away_score": "Away",
+            "score_diff": "Diff", "momentum": "Momentum",
+            "home_win_prob": "Home Win %", "description": "Last Play"
+        }
+        display.rename(columns={k:v for k,v in col_rename.items() if k in display.columns}, inplace=True)
+        if "Home Win %" in display.columns:
+            display["Home Win %"] = display["Home Win %"].map("{:.1%}".format)
+        if "Diff" in display.columns:
+            display["Diff"] = display["Diff"].map(lambda x: f"+{x}" if x > 0 else str(x))
+        if "Momentum" in display.columns:
+            display["Momentum"] = display["Momentum"].map(lambda x: f"{x:+.2f}")
         st.dataframe(
             display.iloc[::-1].reset_index(drop=True).head(50),
             use_container_width=True, height=320,
@@ -1027,17 +1176,25 @@ def main():
 
     # ── KEY METRICS ROW ────────────────────────────────────────────────────
     st.markdown("<div class='section-header'>MODEL SNAPSHOT</div>", unsafe_allow_html=True)
-    mc1, mc2, mc3, mc4, mc5 = st.columns(5)
-    for col, label, val in [
-        (mc1, "Home Win Prob",   f"{current_prob:.1%}"),
-        (mc2, "Away Win Prob",   f"{1-current_prob:.1%}"),
-        (mc3, "Score Diff",      f"{current_hs - current_as:+d}"),
-        (mc4, "Time Remaining",  fmt_clock(period, clock_sec).replace("  "," ")),
-        (mc5, "Plays Tracked",   f"{len(hist):,}"),
+    mc1, mc2, mc3, mc4, mc5, mc6 = st.columns(6)
+
+    # Momentum from last tracked play
+    live_momentum = hist["momentum"].iloc[-1] if not hist.empty and "momentum" in hist.columns else 0.0
+    mom_pct  = f"{live_momentum:+.0%}"
+    mom_color= "#1D9E75" if live_momentum > 0.05 else "#E24B4A" if live_momentum < -0.05 else "#8b949e"
+
+    for col, label, val, color in [
+        (mc1, "Home Win Prob",  f"{current_prob:.1%}",                       None),
+        (mc2, "Away Win Prob",  f"{1-current_prob:.1%}",                      None),
+        (mc3, "Score Diff",     f"{current_hs - current_as:+d}",              None),
+        (mc4, "Time Remaining", fmt_clock(period, clock_sec).replace("  "," "), None),
+        (mc5, "Plays Tracked",  f"{len(hist):,}",                             None),
+        (mc6, "Momentum",       mom_pct,                                       mom_color),
     ]:
+        color_style = f"color:{color}" if color else ""
         col.markdown(f"""<div class="metric-box">
             <div class="metric-label">{label}</div>
-            <div class="metric-value">{val}</div>
+            <div class="metric-value" style="{color_style}">{val}</div>
         </div>""", unsafe_allow_html=True)
 
     # ── AUTO-REFRESH ───────────────────────────────────────────────────────
