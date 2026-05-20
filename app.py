@@ -908,12 +908,22 @@ def main():
 
         st.markdown("---")
         st.markdown("**Model Info**")
-        st.caption(f"AUC: {0.8539:.4f} · Brier: {0.1560:.4f}")
+        # Load metrics dynamically from checkpoint so they update with new models
+        try:
+            _ckpt_meta = torch.load(MODEL_DIR / "win_prob_net.pth",
+                                    map_location="cpu", weights_only=False)
+            _tm = _ckpt_meta.get("test_metrics", {})
+            _auc   = _tm.get("roc_auc",   0.8585)
+            _brier = _tm.get("brier",      0.1529)
+            _mv    = _ckpt_meta.get("model_version", "phase4_net_rating")
+        except Exception:
+            _auc = 0.8585; _brier = 0.1529; _mv = "phase4_net_rating"
+        st.caption(f"AUC: {_auc:.4f} · Brier: {_brier:.4f}")
         st.caption(f"Temperature T: {T:.4f}")
-        st.caption(f"Device: {str(device).upper()}")
+        st.caption(f"Device: {str(device).upper()} · {_mv}")
         st.markdown("**Phase 4 Active**")
-        st.caption("✅ Elo time-decay (5% floor)")
-        st.caption("✅ Momentum window (12 plays)")
+        st.caption("✅ NET rating (replaces Elo)")
+        st.caption("✅ Conditional momentum (35-65%)")
         st.caption("✅ Finals: live series wins")
         st.markdown("---")
 
@@ -1090,12 +1100,13 @@ def main():
     col_away, col_mid, col_home, col_gauge = st.columns([2, 1.2, 2, 2.5])
 
     with col_away:
+        at_rtg_str = f"{at_rtg:+.1f}" if is_net else f"{at_rtg:.0f}"
         st.markdown(f"""
         <div class="score-card" style="border-top:4px solid {at_color}">
             <div class="team-code" style="color:{at_color}">{at_code}</div>
             <div class="score-num">{current_as}</div>
             <div class="record">{at_name}</div>
-            <div class="record">{rtg_label} {at_rtg:+.1f}" if is_net else f"{rtg_label} {at_rtg:.0f}</div>
+            <div class="record">{rtg_label} {at_rtg_str}</div>
         </div>""", unsafe_allow_html=True)
 
     with col_mid:
@@ -1112,12 +1123,13 @@ def main():
         </div>""", unsafe_allow_html=True)
 
     with col_home:
+        ht_rtg_str = f"{ht_rtg:+.1f}" if is_net else f"{ht_rtg:.0f}"
         st.markdown(f"""
         <div class="score-card" style="border-top:4px solid {ht_color}">
             <div class="team-code" style="color:{ht_color}">{ht_code}</div>
             <div class="score-num">{current_hs}</div>
             <div class="record">{ht_name}</div>
-            <div class="record">{rtg_label} {ht_rtg:+.1f}" if is_net else f"{rtg_label} {ht_rtg:.0f}</div>
+            <div class="record">{rtg_label} {ht_rtg_str}</div>
         </div>""", unsafe_allow_html=True)
 
     with col_gauge:
