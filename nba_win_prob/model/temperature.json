@@ -1,8 +1,6 @@
 {
-  "temperature": 1.0598101261085822,
-  "hl_p_before": 0.0,
-  "hl_p_after": 0.0,
-  "brier_before": 0.16470104455947876,
-  "brier_after": 0.16463269677304823,
-  "phase2_auc": 0.8539449068953028
+  "temperature": 1.043828707753281,
+  "model_version": "phase4_net_rating",
+  "brier_before": 0.15775224566459656,
+  "brier_after": 0.15776063352029596
 }
