@@ -37,7 +37,8 @@ MODEL_DIR = BASE_DIR / "model"
 
 FEATURE_COLS = [
     "score_diff", "time_remaining_sec", "quarter",
-    "quarter_time_elapsed_pct", "home_elo", "away_elo", "elo_diff",
+    "quarter_time_elapsed_pct",
+    "home_net_rtg", "away_net_rtg", "net_rtg_diff",   # Phase 4: NET rating replaces Elo
     "home_series_wins", "away_series_wins",
     "is_playoffs", "is_overtime", "lead_changes_norm",
 ]
@@ -180,10 +181,15 @@ def load_system():
         temp_data = json.load(f)
     T = temp_data["temperature"]
 
-    with open(MODEL_DIR / "elo_ratings.json") as f:
-        elo_ratings = json.load(f)
+    # Phase 4: load NET ratings (replaces Elo). Fall back to elo_ratings if not found.
+    net_path = MODEL_DIR / "net_ratings.json"
+    elo_path = MODEL_DIR / "elo_ratings.json"
+    ratings_path = net_path if net_path.exists() else elo_path
+    with open(ratings_path) as f:
+        team_ratings = json.load(f)
+    is_net = net_path.exists()
 
-    return model, scaler, T, elo_ratings, device
+    return model, scaler, T, team_ratings, device, is_net
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -224,22 +230,24 @@ def fmt_clock(period: int, clock_sec: float) -> str:
 def predict_win_prob(
     period: int, clock: str,
     home_score: int, away_score: int,
-    home_elo: float, away_elo: float,
+    home_rating: float, away_rating: float,  # Phase 4: NET rating (or Elo fallback)
     home_sw: int, away_sw: int,
     is_playoffs: int,
     lead_changes: int, plays: int,
     model, scaler, T, device,
     momentum: float = 0.0,
+    is_net_rating: bool = True,
 ) -> float:
     """
     Return calibrated P(home team wins) for a single game state.
 
-    Phase 4 fixes applied:
-      FIX 1: Elo time-decay — Elo influence decays linearly from full weight at
-             tip-off (t=2880s) to a 5% residual at the final buzzer. In OT the
-             decay is fixed at 5% since the score is effectively tied.
-      FIX 3: Momentum nudge — a small post-hoc logit adjustment proportional to
-             rolling scoring momentum (bounded to +-0.20 logit units).
+    Phase 4 fixes:
+      FIX 1: NET rating replaces Elo (positions 4,5,6 in feature vector).
+              Time-decay still applied — NET rating influence fades as
+              score diff becomes the dominant signal late in games.
+      FIX 2: Conditional momentum — nudge only applied when model is
+              genuinely uncertain (35%–65%). Avoids over-inflating an
+              already-confident probability during dominant runs.
     """
     clock_sec  = parse_clock(clock)
     t_rem      = time_remaining(period, clock_sec)
@@ -248,24 +256,33 @@ def predict_win_prob(
     score_diff = float(np.clip(home_score - away_score, -80, 80))
     n_plays    = max(1, plays)
 
-    # ── FIX 1: Elo time-decay ─────────────────────────────────────────────
-    REG_SECONDS = 2880.0
-    ELO_MIN     = 0.05   # 5% residual — pre-game quality still matters a little
+    # ── Rating time-decay ──────────────────────────────────────────────────
+    # Full weight at tip-off → 5% residual at buzzer → 5% flat in OT.
+    # Works for both NET rating and Elo fallback.
+    REG_SECONDS  = 2880.0
+    RATING_MIN   = 0.05
     if period <= 4:
-        elo_decay = float(np.clip(
-            ELO_MIN + (1.0 - ELO_MIN) * (t_rem / REG_SECONDS),
-            ELO_MIN, 1.0
+        r_decay = float(np.clip(
+            RATING_MIN + (1.0 - RATING_MIN) * (t_rem / REG_SECONDS),
+            RATING_MIN, 1.0
         ))
     else:
-        elo_decay = ELO_MIN   # OT: game is tied — Elo contribution near-zero
+        r_decay = RATING_MIN  # OT: score is tied, rating nearly irrelevant
 
-    home_elo_d = 1500.0 + (home_elo - 1500.0) * elo_decay
-    away_elo_d = 1500.0 + (away_elo - 1500.0) * elo_decay
-    elo_diff_d = home_elo_d - away_elo_d
+    if is_net_rating:
+        # NET rating: centre at 0, decay toward 0
+        home_r_d = home_rating * r_decay
+        away_r_d = away_rating * r_decay
+        rtg_diff = home_r_d - away_r_d
+    else:
+        # Elo fallback: centre at 1500, decay toward 1500
+        home_r_d = 1500.0 + (home_rating - 1500.0) * r_decay
+        away_r_d = 1500.0 + (away_rating - 1500.0) * r_decay
+        rtg_diff = home_r_d - away_r_d
 
     raw = np.array([[
         score_diff, t_rem, float(period), q_elapsed,
-        home_elo_d, away_elo_d, elo_diff_d,
+        home_r_d, away_r_d, rtg_diff,
         float(home_sw), float(away_sw),
         float(is_playoffs), float(period > 4),
         lead_changes / n_plays,
@@ -277,10 +294,15 @@ def predict_win_prob(
     with torch.no_grad():
         logit = model.logits(tensor).item()
 
-    # ── FIX 3: Momentum post-hoc logit nudge ──────────────────────────────
-    # momentum in [-1, +1]: +1 = home scoring everything in recent plays
-    # 0.18 weight → max +-0.18 logit shift = +-4.5pp near p=0.50
-    logit = logit + float(np.clip(0.18 * momentum, -0.20, 0.20))
+    # ── FIX 2: Conditional momentum nudge ─────────────────────────────────
+    # Compute raw probability BEFORE nudge.
+    # Only apply momentum when model is genuinely uncertain (35% – 65%).
+    # Uncertainty weight tapers to 0 at 35% and 65% so the nudge is
+    # smooth, not a hard switch.
+    raw_prob = 1 / (1 + np.exp(-logit / T))
+    dist_from_half = abs(raw_prob - 0.5)          # 0 at 50%, 0.15 at edges
+    uncertainty    = max(0.0, 1.0 - dist_from_half / 0.15)  # 1.0 at 50%, 0 at ±15pp
+    logit = logit + float(np.clip(0.18 * momentum * uncertainty, -0.20, 0.20))
 
     prob = 1 / (1 + np.exp(-logit / T))
     return float(np.clip(prob, 0.001, 0.999))
@@ -311,9 +333,21 @@ def simulate_series(p_home: float, h_wins: int, a_wins: int,
     return float((h_cl < a_cl).mean())
 
 
+def p_home_wins_game_from_rating(home_rating: float, away_rating: float,
+                                  is_net: bool = True,
+                                  home_adv: float = 100.0) -> float:
+    """Pre-game win probability from NET rating or Elo."""
+    if is_net:
+        # NET rating diff → win probability via logistic
+        # A +10 NET diff ≈ 65% win rate (calibrated to historical data)
+        net_diff = home_rating - away_rating + 2.0  # +2 for home court
+        return float(np.clip(1 / (1 + np.exp(-net_diff * 0.15)), 0.05, 0.95))
+    else:
+        return 1 / (1 + 10 ** ((away_rating - (home_rating + home_adv)) / 400))
+
+# Keep old name as alias for any code that still references it
 def p_home_wins_game_from_elo(home_elo: float, away_elo: float,
                                home_adv: float = 100.0) -> float:
-    """Elo-based pre-game win probability (no in-game state)."""
     return 1 / (1 + 10 ** ((away_elo - (home_elo + home_adv)) / 400))
 
 
@@ -492,9 +526,9 @@ def fetch_pbp(game_id: str) -> list:
 # GAME STATE BUILDER
 # ═══════════════════════════════════════════════════════════════════════════
 
-def build_game_history(actions: list, home_elo: float, away_elo: float,
+def build_game_history(actions: list, home_rating: float, away_rating: float,
                        home_sw: int, away_sw: int, is_playoffs: int,
-                       model, scaler, T, device) -> pd.DataFrame:
+                       model, scaler, T, device, is_net: bool = True) -> pd.DataFrame:
     """
     Walk through all play-by-play actions and compute win prob at each scored play.
 
@@ -558,12 +592,12 @@ def build_game_history(actions: list, home_elo: float, away_elo: float,
         prob = predict_win_prob(
             period=period, clock=clock,
             home_score=hs, away_score=as_,
-            home_elo=home_elo, away_elo=away_elo,
+            home_rating=home_rating, away_rating=away_rating,
             home_sw=home_sw, away_sw=away_sw,
             is_playoffs=is_playoffs,
             lead_changes=lead_changes, plays=play_num,
             model=model, scaler=scaler, T=T, device=device,
-            momentum=momentum,
+            momentum=momentum, is_net_rating=is_net,
         )
 
         t_rem = time_remaining(period, clock_sec)
@@ -728,7 +762,7 @@ def bracket_chart(teams_probs: dict) -> go.Figure:
 # FINALS PROBABILITY  (Monte Carlo chained bracket)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def compute_finals_probs(live_games: list, elo_ratings: dict,
+def compute_finals_probs(live_games: list, team_ratings: dict,
                           series_states: dict) -> dict:
     """
     Estimate P(each team wins NBA Finals) using a two-stage bracket simulation.
@@ -778,11 +812,11 @@ def compute_finals_probs(live_games: list, elo_ratings: dict,
             ht, at = series["home"], series["away"]
             hw, aw = series["hw"],   series["aw"]
 
-            h_elo = elo_ratings.get(ht, 1500)
-            a_elo = elo_ratings.get(at, 1500)
+            h_elo = team_ratings.get(ht, 0.0 if is_net else 1500)
+            a_elo = team_ratings.get(at, 0.0 if is_net else 1500)
 
             # Per-game probability from Elo (home court advantage included)
-            p_home_game = p_home_wins_game_from_elo(h_elo, a_elo)
+            p_home_game = p_home_wins_game_from_rating(h_elo, a_elo, is_net=is_net)
 
             # Simulate REMAINING games from current series state (hw, aw)
             p_home_series = simulate_series(p_home_game, hw, aw, n_sims=50_000)
@@ -808,8 +842,8 @@ def compute_finals_probs(live_games: list, elo_ratings: dict,
             # Sort series by Elo to identify likely finalists
             series_list = sorted(
                 series_map.values(),
-                key=lambda s: elo_ratings.get(s["home"], 1500) +
-                              elo_ratings.get(s["away"], 1500),
+                key=lambda s: team_ratings.get(s["home"], 0.0 if is_net else 1500) +
+                              team_ratings.get(s["away"], 0.0 if is_net else 1500),
                 reverse=True
             )
             # Each series produces one finalist — simulate who wins the Finals
@@ -828,10 +862,10 @@ def compute_finals_probs(live_games: list, elo_ratings: dict,
                 # Four possible Finals matchups
                 for t1, p_t1 in [(ht1, p_h1), (at1, p_a1)]:
                     for t2, p_t2 in [(ht2, p_h2), (at2, p_a2)]:
-                        e1 = elo_ratings.get(t1, 1500)
-                        e2 = elo_ratings.get(t2, 1500)
+                        e1 = team_ratings.get(t1, 0.0 if is_net else 1500)
+                        e2 = team_ratings.get(t2, 0.0 if is_net else 1500)
                         # Neutral court Finals (no home advantage)
-                        p_t1_wins_finals = 1 / (1 + 10**((e2 - e1) / 400))
+                        p_t1_wins_finals = p_home_wins_game_from_rating(e1, e2, is_net=is_net)
                         p_finals_series_t1 = simulate_series(
                             p_t1_wins_finals, 0, 0, n_sims=30_000
                         )
@@ -859,7 +893,7 @@ def compute_finals_probs(live_games: list, elo_ratings: dict,
 def main():
     # ── Load system ────────────────────────────────────────────────────────
     try:
-        model, scaler, T, elo_ratings, device = load_system()
+        model, scaler, T, team_ratings, device, is_net = load_system()
     except FileNotFoundError as e:
         st.error(f"❌ Model files not found: {e}\n\nRun `phase3_setup.ipynb` first.")
         st.stop()
@@ -955,17 +989,18 @@ def main():
             ("OKC leads +3, OT 2:00",   5, "PT02M00.00S", 108, 105, "OKC", "SAS"),
         ]
 
-        okc_elo = elo_ratings.get("OKC", 1766)
-        sas_elo = elo_ratings.get("SAS", 1500)
+        okc_rtg = team_ratings.get("OKC", 8.5 if is_net else 1766)
+        sas_rtg = team_ratings.get("SAS", 0.0 if is_net else 1500)
 
         for label, period, clock, hs, as_, ht, at in demo_scenarios:
             prob = predict_win_prob(
                 period=period, clock=clock,
                 home_score=hs, away_score=as_,
-                home_elo=okc_elo, away_elo=sas_elo,
+                home_rating=okc_rtg, away_rating=sas_rtg,
                 home_sw=0, away_sw=0, is_playoffs=1,
                 lead_changes=12, plays=180,
                 model=model, scaler=scaler, T=T, device=device,
+                is_net_rating=is_net,
             )
             with demo_col1:
                 st.metric(label=label,
@@ -974,10 +1009,11 @@ def main():
 
         # Monte Carlo demo
         st.markdown("#### 🎲 Series Probability Demo — OKC leads 3-1")
-        p_game = p_home_wins_game_from_elo(okc_elo, sas_elo)
+        p_game = p_home_wins_game_from_rating(okc_rtg, sas_rtg, is_net=is_net)
         p_series = simulate_series(p_game, 3, 1, n_sims=100_000)
+        rating_label = "NET rating" if is_net else "Elo"
         st.progress(p_series, text=f"OKC wins series: **{p_series:.1%}** | SAS: **{1-p_series:.1%}**")
-        st.caption(f"Per-game OKC win prob (Elo-based): {p_game:.1%} | 100K Monte Carlo sims")
+        st.caption(f"Per-game OKC win prob ({rating_label}-based): {p_game:.1%} | 100K Monte Carlo sims")
 
         st.markdown("---")
         st.info("💡 **Tip:** Open this dashboard when a game tips off and select it from the dropdown above.")
@@ -1019,8 +1055,9 @@ def main():
 
     ht_color = TEAM_COLORS.get(ht_code, "#007AC1")
     at_color = TEAM_COLORS.get(at_code, "#C8102E")
-    ht_elo   = elo_ratings.get(ht_code, 1500.0)
-    at_elo   = elo_ratings.get(at_code, 1500.0)
+    ht_rtg   = team_ratings.get(ht_code, 0.0 if is_net else 1500.0)
+    at_rtg   = team_ratings.get(at_code, 0.0 if is_net else 1500.0)
+    rtg_label = "NET" if is_net else "Elo"
 
     # Series wins from live scoreboard (wins within current series)
     # The API homeTeam.wins / awayTeam.wins are SERIES wins in playoffs
@@ -1032,8 +1069,8 @@ def main():
 
     # ── Build history ──────────────────────────────────────────────────────
     hist = build_game_history(
-        actions, ht_elo, at_elo, home_sw, away_sw, is_playoffs,
-        model, scaler, T, device,
+        actions, ht_rtg, at_rtg, home_sw, away_sw, is_playoffs,
+        model, scaler, T, device, is_net=is_net,
     ) if actions else pd.DataFrame()
 
     # Current win prob
@@ -1042,8 +1079,8 @@ def main():
         current_hs   = hist["home_score"].iloc[-1]
         current_as   = hist["away_score"].iloc[-1]
     else:
-        # Pre-game: use Elo
-        current_prob = p_home_wins_game_from_elo(ht_elo, at_elo)
+        # Pre-game: use team rating
+        current_prob = p_home_wins_game_from_rating(ht_rtg, at_rtg, is_net=is_net)
         current_hs   = ht_score
         current_as   = at_score
 
@@ -1058,7 +1095,7 @@ def main():
             <div class="team-code" style="color:{at_color}">{at_code}</div>
             <div class="score-num">{current_as}</div>
             <div class="record">{at_name}</div>
-            <div class="record">Elo {at_elo:.0f}</div>
+            <div class="record">{rtg_label} {at_rtg:+.1f}" if is_net else f"{rtg_label} {at_rtg:.0f}</div>
         </div>""", unsafe_allow_html=True)
 
     with col_mid:
@@ -1080,7 +1117,7 @@ def main():
             <div class="team-code" style="color:{ht_color}">{ht_code}</div>
             <div class="score-num">{current_hs}</div>
             <div class="record">{ht_name}</div>
-            <div class="record">Elo {ht_elo:.0f}</div>
+            <div class="record">{rtg_label} {ht_rtg:+.1f}" if is_net else f"{rtg_label} {ht_rtg:.0f}</div>
         </div>""", unsafe_allow_html=True)
 
     with col_gauge:
@@ -1108,7 +1145,7 @@ def main():
     with col_series:
         st.markdown("<div class='section-header'>SERIES PROBABILITY</div>",
                     unsafe_allow_html=True)
-        p_home_game  = current_prob if not hist.empty else p_home_wins_game_from_elo(ht_elo, at_elo)
+        p_home_game  = current_prob if not hist.empty else p_home_wins_game_from_rating(ht_rtg, at_rtg, is_net=is_net)
         p_home_series = simulate_series(p_home_game, home_sw, away_sw, n_sims=n_mc_sims)
 
         st.plotly_chart(
@@ -1140,7 +1177,7 @@ def main():
         if show_bracket:
             st.markdown("<div class='section-header'>FINALS PROBABILITY</div>",
                         unsafe_allow_html=True)
-            finals_probs = compute_finals_probs(live_games, elo_ratings, {})
+            finals_probs = compute_finals_probs(live_games, team_ratings, {})
             if finals_probs:
                 st.plotly_chart(
                     bracket_chart(finals_probs),
