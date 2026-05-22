@@ -1142,6 +1142,10 @@ def main():
             # Rebuild DataFrame
             hist_df = pd.DataFrame(sel_rec["timeline"])
 
+            # Ensure column compatibility with win_prob_chart (expects action_num)
+            if "play_num" in hist_df.columns and "action_num" not in hist_df.columns:
+                hist_df = hist_df.rename(columns={"play_num": "action_num"})
+
             # ── Score card row ─────────────────────────────────────────────
             h_color = TEAM_COLORS.get(home_c, "#007AC1")
             a_color = TEAM_COLORS.get(away_c, "#C8102E")
