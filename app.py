@@ -313,24 +313,65 @@ def predict_win_prob(
 # ═══════════════════════════════════════════════════════════════════════════
 
 def simulate_series(p_home: float, h_wins: int, a_wins: int,
-                    best_of: int = 7, n_sims: int = 100_000) -> float:
-    """Vectorised Monte Carlo: P(home wins series) from current state."""
+                    best_of: int = 7, n_sims: int = 100_000,
+                    h_form: float = 0.0, a_form: float = 0.0) -> float:
+    """
+    Vectorised Monte Carlo: P(home wins series) from current state.
+
+    Phase 5 additions:
+    · h_form / a_form: in-series form blending (see adjusted_series_p_game)
+    · Hard cap: result always in [0.03, 0.97] — never returns 100% or 0%
+      for an in-progress series regardless of NET/Elo gap.
+    """
     target = (best_of // 2) + 1
     h_need = target - h_wins
     a_need = target - a_wins
-    if h_need <= 0: return 1.0
-    if a_need <= 0: return 0.0
+    # Already clinched → still cap to allow tail events
+    if h_need <= 0: return 0.97
+    if a_need <= 0: return 0.03
+
+    # Blend per-game probability with in-series form
+    p_home_adj = float(np.clip(p_home + h_form - a_form, 0.05, 0.95))
 
     rng   = np.random.default_rng()
     max_g = h_need + a_need - 1
-    games = rng.random((n_sims, max_g)) < p_home
+    games = rng.random((n_sims, max_g)) < p_home_adj
     h_cum = np.cumsum(games.astype(np.int16), axis=1)
     a_cum = np.cumsum((~games).astype(np.int16), axis=1)
     h_ever = h_cum[:, -1] >= h_need
     a_ever = a_cum[:, -1] >= a_need
     h_cl   = np.where(h_ever, np.argmax(h_cum >= h_need, axis=1), max_g + 1)
     a_cl   = np.where(a_ever, np.argmax(a_cum >= a_need, axis=1), max_g + 1)
-    return float((h_cl < a_cl).mean())
+    raw = float((h_cl < a_cl).mean())
+    # Hard cap — a best-of-7 series is never truly 98%+ certain
+    return float(np.clip(raw, 0.03, 0.97))
+
+
+def _series_form_adjustment(h_wins: int, a_wins: int,
+                             net_p_home: float) -> tuple:
+    """
+    Compute a small form-based blending adjustment for the Monte Carlo.
+
+    Logic: If the home team has won more games than expected given their
+    NET rating, they're out-performing. Adjust p_home slightly upward.
+    Uses a conservative 20% blend weight so a 2-0 sweep only moves
+    the probability by ~3-5pp, not dramatically.
+
+    Returns (h_form_adj, a_form_adj) to add/subtract from p_home.
+    """
+    games_played = h_wins + a_wins
+    if games_played == 0:
+        return 0.0, 0.0
+
+    # Expected wins for home team based purely on NET rating
+    expected_h = net_p_home * games_played
+    actual_h   = h_wins
+    outperformance = (actual_h - expected_h) / games_played   # in [-1, +1]
+
+    # Blend weight: 20% form, 80% NET rating
+    FORM_WEIGHT = 0.20
+    adj = float(np.clip(outperformance * FORM_WEIGHT, -0.08, 0.08))
+    return adj, -adj   # home gains → away loses equally
 
 
 def p_home_wins_game_from_rating(home_rating: float, away_rating: float,
@@ -818,8 +859,12 @@ def compute_finals_probs(live_games: list, team_ratings: dict,
             # Per-game probability from Elo (home court advantage included)
             p_home_game = p_home_wins_game_from_rating(h_elo, a_elo, is_net=is_net)
 
+            # ── Phase 5: in-series form adjustment ────────────────────────
+            h_form, a_form = _series_form_adjustment(hw, aw, p_home_game)
+
             # Simulate REMAINING games from current series state (hw, aw)
-            p_home_series = simulate_series(p_home_game, hw, aw, n_sims=50_000)
+            p_home_series = simulate_series(p_home_game, hw, aw, n_sims=50_000,
+                                            h_form=h_form, a_form=a_form)
             p_away_series = 1.0 - p_home_series
 
             team_series_prob[ht] = team_series_prob.get(ht, 0.0) + p_home_series
@@ -1003,10 +1048,11 @@ def main():
         st.caption(f"AUC: {_auc:.4f} · Brier: {_brier:.4f}")
         st.caption(f"Temperature T: {T:.4f}")
         st.caption(f"Device: {str(device).upper()} · {_mv}")
-        st.markdown("**Phase 4 Active**")
+        st.markdown("**Phase 5 Active**")
         st.caption("✅ NET rating (replaces Elo)")
         st.caption("✅ Conditional momentum (35-65%)")
-        st.caption("✅ Finals: live series wins")
+        st.caption("✅ Series form adjustment (20% blend)")
+        st.caption("✅ Series cap [3%–97%]")
         st.markdown("---")
 
         show_bracket = st.toggle("Show Finals Probability", value=True)
@@ -1363,7 +1409,10 @@ def main():
         st.markdown("<div class='section-header'>SERIES PROBABILITY</div>",
                     unsafe_allow_html=True)
         p_home_game  = current_prob if not hist.empty else p_home_wins_game_from_rating(ht_rtg, at_rtg, is_net=is_net)
-        p_home_series = simulate_series(p_home_game, home_sw, away_sw, n_sims=n_mc_sims)
+        # Phase 5: apply series form adjustment
+        _hf, _af     = _series_form_adjustment(home_sw, away_sw, p_home_wins_game_from_rating(ht_rtg, at_rtg, is_net=is_net))
+        p_home_series = simulate_series(p_home_game, home_sw, away_sw, n_sims=n_mc_sims,
+                                        h_form=_hf, a_form=_af)
 
         st.plotly_chart(
             series_prob_chart(ht_code, at_code, p_home_series,
