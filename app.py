@@ -887,6 +887,88 @@ def compute_finals_probs(live_games: list, team_ratings: dict,
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# GAME HISTORY — cache and replay
+# ═══════════════════════════════════════════════════════════════════════════
+
+HISTORY_DIR = BASE_DIR / "game_history"
+HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def save_game_history(game_id: str, away_code: str, home_code: str,
+                      hist: pd.DataFrame, final_away: int, final_home: int,
+                      series_away: int, series_home: int):
+    """
+    Save a completed game's probability timeline to disk so it can be
+    replayed in History mode without calling the API again.
+    Saves to  nba_win_prob/game_history/<game_id>.json
+    """
+    path = HISTORY_DIR / f"{game_id}.json"
+    if path.exists():
+        return   # already saved — don't overwrite
+    if hist.empty or len(hist) < 20:
+        return   # not enough data worth saving
+
+    record = {
+        "game_id"      : game_id,
+        "away_code"    : away_code,
+        "home_code"    : home_code,
+        "final_away"   : int(final_away),
+        "final_home"   : int(final_home),
+        "series_away"  : int(series_away),
+        "series_home"  : int(series_home),
+        "saved_at"     : datetime.now(timezone.utc).isoformat(),
+        "plays"        : len(hist),
+        "timeline"     : hist[[
+            "play_num", "period", "clock_sec", "time_remaining",
+            "home_score", "away_score", "score_diff",
+            "home_win_prob", "momentum",
+        ]].to_dict("records"),
+    }
+    try:
+        with open(path, "w") as f:
+            json.dump(record, f, indent=None)   # compact JSON
+    except Exception:
+        pass
+
+
+def load_game_history(game_id: str) -> dict:
+    """Load a saved game record. Returns None if not found."""
+    path = HISTORY_DIR / f"{game_id}.json"
+    if not path.exists():
+        return None
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def list_saved_games() -> list:
+    """
+    Return a list of saved game records sorted newest first.
+    Each entry: {game_id, label, away, home, final_away, final_home, plays}
+    """
+    games = []
+    for path in sorted(HISTORY_DIR.glob("*.json"), reverse=True):
+        try:
+            with open(path) as f:
+                rec = json.load(f)
+            away = rec.get("away_code", "???")
+            home = rec.get("home_code", "???")
+            fa   = rec.get("final_away", 0)
+            fh   = rec.get("final_home", 0)
+            winner = home if fh > fa else away
+            label = (f"{away} {fa} @ {home} {fh}  "
+                     f"({'OT' if rec.get('plays',0) > 500 else 'Reg'})  "
+                     f"— {winner} wins")
+            games.append({"game_id": rec["game_id"], "label": label,
+                          "record": rec})
+        except Exception:
+            continue
+    return games
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # MAIN DASHBOARD
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -934,6 +1016,14 @@ def main():
                                          value=100_000)
 
         st.markdown("---")
+        # ── View mode: Live vs History ─────────────────────────────────────
+        st.markdown("**View Mode**")
+        view_mode = st.radio("", ["🔴 Live Games", "📼 Game History"],
+                             label_visibility="collapsed")
+        if view_mode == "📼 Game History":
+            st.caption("Replay any tracked game's win probability curve.")
+
+        st.markdown("---")
         last_refresh = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
         st.caption(f"Last refresh: {last_refresh}")
         st.markdown("---")
@@ -978,6 +1068,107 @@ def main():
 
     st.markdown("<h1 style='color:#e6edf3;font-size:1.8rem;margin-bottom:4px'>🏀 NBA Live Win Probability</h1>",
                 unsafe_allow_html=True)
+
+    # ── History mode ───────────────────────────────────────────────────────
+    if view_mode == "📼 Game History":
+        saved = list_saved_games()
+        if not saved:
+            st.info(
+                "**No saved games yet.**\n\n"
+                "Games are automatically saved once they finish. "
+                "Switch to Live mode, watch a game to completion, then come back here."
+            )
+        else:
+            st.markdown("<div class='section-header'>GAME HISTORY</div>",
+                        unsafe_allow_html=True)
+            labels    = [g["label"] for g in saved]
+            sel_label = st.selectbox("Select a game", labels,
+                                     label_visibility="collapsed")
+            sel_rec   = next(g["record"] for g in saved
+                             if g["label"] == sel_label)
+
+            away_c = sel_rec["away_code"]
+            home_c = sel_rec["home_code"]
+            fa, fh = sel_rec["final_away"], sel_rec["final_home"]
+            winner = home_c if fh > fa else away_c
+            plays  = sel_rec["plays"]
+
+            # Rebuild DataFrame
+            hist_df = pd.DataFrame(sel_rec["timeline"])
+
+            # ── Score card row ─────────────────────────────────────────────
+            h_color = TEAM_COLORS.get(home_c, "#007AC1")
+            a_color = TEAM_COLORS.get(away_c, "#C8102E")
+            col_a, col_m, col_h, col_g = st.columns([2, 1.2, 2, 2.5])
+            with col_a:
+                st.markdown(f"""
+                <div class="score-card" style="border-top:4px solid {a_color}">
+                    <div class="team-code" style="color:{a_color}">{away_c}</div>
+                    <div class="score-num">{fa}</div>
+                    <div class="record">{'WIN' if fa > fh else ''}</div>
+                </div>""", unsafe_allow_html=True)
+            with col_m:
+                st.markdown(f"""
+                <div style="text-align:center;padding-top:24px">
+                    <span class="final-badge">FINAL</span>
+                    <div style="font-size:0.8rem;color:#8b949e;margin-top:10px">{plays:,} plays</div>
+                </div>""", unsafe_allow_html=True)
+            with col_h:
+                st.markdown(f"""
+                <div class="score-card" style="border-top:4px solid {h_color}">
+                    <div class="team-code" style="color:{h_color}">{home_c}</div>
+                    <div class="score-num">{fh}</div>
+                    <div class="record">{'WIN' if fh > fa else ''}</div>
+                </div>""", unsafe_allow_html=True)
+            with col_g:
+                fin_prob = hist_df["home_win_prob"].iloc[-1]
+                st.plotly_chart(
+                    gauge_chart(fin_prob, home_c, away_c, h_color, a_color),
+                    use_container_width=True,
+                    config={"displayModeBar": False},
+                )
+
+            # ── Win probability chart ──────────────────────────────────────
+            st.markdown("<div class='section-header'>WIN PROBABILITY REPLAY</div>",
+                        unsafe_allow_html=True)
+            st.plotly_chart(
+                win_prob_chart(hist_df, home_c, away_c, h_color, a_color),
+                use_container_width=True,
+                config={"displayModeBar": False},
+            )
+
+            # ── Key stats ─────────────────────────────────────────────────
+            st.markdown("<div class='section-header'>GAME SUMMARY</div>",
+                        unsafe_allow_html=True)
+            mc1, mc2, mc3, mc4, mc5 = st.columns(5)
+            max_lead_h = int(hist_df["score_diff"].max())
+            max_lead_a = int(-hist_df["score_diff"].min())
+            trough     = hist_df.loc[hist_df["home_win_prob"].idxmin()]
+            peak       = hist_df.loc[hist_df["home_win_prob"].idxmax()]
+            for col, label, val in [
+                (mc1, "Winner",       winner),
+                (mc2, "Margin",       f"{abs(fh-fa)} pts"),
+                (mc3, f"{home_c} max lead", f"+{max_lead_h}"),
+                (mc4, f"{away_c} max lead", f"+{max_lead_a}"),
+                (mc5, "Lowest prob",  f"{hist_df['home_win_prob'].min():.0%} {home_c}"),
+            ]:
+                col.markdown(f"""<div class="metric-box">
+                    <div class="metric-label">{label}</div>
+                    <div class="metric-value">{val}</div>
+                </div>""", unsafe_allow_html=True)
+
+            # ── Biggest swing ──────────────────────────────────────────────
+            hist_df["prob_delta"] = hist_df["home_win_prob"].diff().abs().fillna(0)
+            top_swing = hist_df.nlargest(1, "prob_delta").iloc[0]
+            q_label   = f"Q{int(top_swing.period)}" if top_swing.period <= 4 else f"OT{int(top_swing.period)-4}"
+            cs        = int(top_swing.clock_sec)
+            st.caption(
+                f"⚡ Biggest single-play swing: **{top_swing.prob_delta:.1%}** — "
+                f"{q_label} {cs//60}:{cs%60:02d}  "
+                f"({home_c} {int(top_swing.home_score)} — "
+                f"{away_c} {int(top_swing.away_score)})"
+            )
+        return   # don't render live mode below
 
     if not live_games:
         st.warning(
@@ -1082,6 +1273,20 @@ def main():
         actions, ht_rtg, at_rtg, home_sw, away_sw, is_playoffs,
         model, scaler, T, device, is_net=is_net,
     ) if actions else pd.DataFrame()
+
+    # ── Auto-save completed games to history ───────────────────────────────
+    # Saves silently once when game_status == 3 (Final) and hist has data.
+    if game_status == 3 and not hist.empty:
+        save_game_history(
+            game_id    = game_id,
+            away_code  = at_code,
+            home_code  = ht_code,
+            hist       = hist,
+            final_away = int(hist["away_score"].iloc[-1]),
+            final_home = int(hist["home_score"].iloc[-1]),
+            series_away= away_sw,
+            series_home= home_sw,
+        )
 
     # Current win prob
     if not hist.empty:
