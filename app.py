@@ -953,6 +953,8 @@ def save_game_history(game_id: str, away_code: str, home_code: str,
     if hist.empty or len(hist) < 20:
         return   # not enough data worth saving
 
+    # build_game_history() uses "action_num"; backfill uses "play_num" — handle both
+    num_col = "action_num" if "action_num" in hist.columns else "play_num"
     record = {
         "game_id"      : game_id,
         "away_code"    : away_code,
@@ -964,10 +966,10 @@ def save_game_history(game_id: str, away_code: str, home_code: str,
         "saved_at"     : datetime.now(timezone.utc).isoformat(),
         "plays"        : len(hist),
         "timeline"     : hist[[
-            "play_num", "period", "clock_sec", "time_remaining",
+            num_col, "period", "clock_sec", "time_remaining",
             "home_score", "away_score", "score_diff",
             "home_win_prob", "momentum",
-        ]].to_dict("records"),
+        ]].rename(columns={num_col: "play_num"}).to_dict("records"),
     }
     try:
         with open(path, "w") as f:
