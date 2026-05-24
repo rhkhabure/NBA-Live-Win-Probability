@@ -350,28 +350,58 @@ def simulate_series(p_home: float, h_wins: int, a_wins: int,
 def _series_form_adjustment(h_wins: int, a_wins: int,
                              net_p_home: float) -> tuple:
     """
-    Compute a small form-based blending adjustment for the Monte Carlo.
+    Compute a form-based adjustment for the Monte Carlo per-game probability.
 
-    Logic: If the home team has won more games than expected given their
-    NET rating, they're out-performing. Adjust p_home slightly upward.
-    Uses a conservative 20% blend weight so a 2-0 sweep only moves
-    the probability by ~3-5pp, not dramatically.
+    Phase 5b — sweep protection:
+    If one team has 0 wins in a series with 3+ games played, cap the
+    opponent's per-game probability at 0.55. In NBA history no team has
+    ever come back from 3-0. Giving the 0-win team 72% pre-game in G4
+    based purely on NET rating is empirically indefensible.
 
-    Returns (h_form_adj, a_form_adj) to add/subtract from p_home.
+    Sweep thresholds (best-of-7):
+      · 0-3 down  → cap leading team at 0.55 per game (returning home)
+      · 0-2 down  → cap at 0.60 (still strong series signal)
+      · 0-1 down  → normal 20% form blend only
+
+    Returns (h_form_adj, a_form_adj) to add/subtract from net_p_home.
     """
     games_played = h_wins + a_wins
     if games_played == 0:
         return 0.0, 0.0
 
-    # Expected wins for home team based purely on NET rating
-    expected_h = net_p_home * games_played
-    actual_h   = h_wins
-    outperformance = (actual_h - expected_h) / games_played   # in [-1, +1]
+    # ── Sweep protection ───────────────────────────────────────────────────
+    # Check if either team has been swept / near-swept with no wins
+    min_wins = min(h_wins, a_wins)
+    max_wins = max(h_wins, a_wins)
 
-    # Blend weight: 20% form, 80% NET rating
-    FORM_WEIGHT = 0.20
+    if min_wins == 0 and max_wins >= 3:
+        # One team has 3+ wins, the other has 0 — sweep territory
+        # Cap the leading team's per-game prob at 0.55 regardless of NET
+        SWEEP_CAP = 0.55
+        if h_wins > a_wins:
+            # Home team is leading the sweep — cap their per-game at 0.55
+            adj = float(np.clip(SWEEP_CAP - net_p_home, -0.40, 0.40))
+        else:
+            # Away team is leading the sweep — cap their per-game at 0.55
+            # which means home team is capped at 1 - 0.55 = 0.45
+            adj = float(np.clip((1.0 - SWEEP_CAP) - net_p_home, -0.40, 0.40))
+        return adj, -adj
+
+    if min_wins == 0 and max_wins == 2:
+        # One team leads 2-0 — softer cap at 0.60
+        SERIES_2_0_CAP = 0.60
+        if h_wins > a_wins:
+            adj = float(np.clip(SERIES_2_0_CAP - net_p_home, -0.30, 0.30))
+        else:
+            adj = float(np.clip((1.0 - SERIES_2_0_CAP) - net_p_home, -0.30, 0.30))
+        return adj, -adj
+
+    # ── Standard 20% form blend for all other series states ───────────────
+    expected_h     = net_p_home * games_played
+    outperformance = (h_wins - expected_h) / games_played   # [-1, +1]
+    FORM_WEIGHT    = 0.20
     adj = float(np.clip(outperformance * FORM_WEIGHT, -0.08, 0.08))
-    return adj, -adj   # home gains → away loses equally
+    return adj, -adj
 
 
 def p_home_wins_game_from_rating(home_rating: float, away_rating: float,
@@ -1053,7 +1083,7 @@ def main():
         st.markdown("**Phase 5 Active**")
         st.caption("✅ NET rating (replaces Elo)")
         st.caption("✅ Conditional momentum (35-65%)")
-        st.caption("✅ Series form adjustment (20% blend)")
+        st.caption("✅ Series form adjustment + sweep cap")
         st.caption("✅ Series cap [3%–97%]")
         st.markdown("---")
 
