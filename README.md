@@ -6,9 +6,6 @@ A real-time NBA in-game win probability system built with a PyTorch neural netwo
 ![PyTorch](https://img.shields.io/badge/PyTorch-2.6.0+cu124-EE4C2C?style=flat-square&logo=pytorch&logoColor=white)
 ![Streamlit](https://img.shields.io/badge/Streamlit-Live-FF4B4B?style=flat-square&logo=streamlit&logoColor=white)
 ![CUDA](https://img.shields.io/badge/CUDA-12.4-76B900?style=flat-square&logo=nvidia&logoColor=white)
-
-**Live dashboard →** *([Click to see model]([https://fifa-worldcup-prediction-kc3azpj8tc2ynw4ylnjqv8.streamlit.app/](https://nba-live-win-probability.streamlit.app/)))*  
-**Related project →** [FIFA Worldcup Model]([https://github.com/rhkhabure/NBA-Live-Win-Probability](https://github.com/rhkhabure/FIFA-WORLDCUP-PREDICTION))
 ---
 
 ##  Dashboard
