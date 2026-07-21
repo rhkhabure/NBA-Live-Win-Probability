@@ -10,7 +10,8 @@ A real-time NBA in-game win probability system built with a PyTorch neural netwo
 ---
 
 ##  Dashboard
-
+> **Live dashboard →** *([Click to see model]([https://fifa-worldcup-prediction-kc3azpj8tc2ynw4ylnjqv8.streamlit.app/](https://nba-live-win-probability.streamlit.app/)))*  
+> **Related project →** [FIFA Worldcup Model]([https://github.com/rhkhabure/NBA-Live-Win-Probability](https://github.com/rhkhabure/FIFA-WORLDCUP-PREDICTION))
 > Live during the 2025 NBA Playoffs — Conference Finals & NBA Finals
 
 The dashboard shows real-time win probability updating play-by-play, series win probability via Monte Carlo simulation, and Finals championship probability for all remaining teams.
