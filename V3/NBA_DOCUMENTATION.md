@@ -79,7 +79,7 @@ nba_api (PlayByPlayV2)
 | Decision | Chosen | Alternatives considered | Reason |
 |---|---|---|---|
 | Season scope | Regular season + playoffs | Playoffs only, regular season only | 10× more data; `is_playoffs` flag preserves context difference; preseason excluded |
-| Player metric | BPM (Basketball Reference) | DARKO DPM, EPM, LEBRON | DARKO/EPM/LEBRON have no free programmatic access; BPM is fully free via `basketball_reference_web_scraper` |
+| Player metric | DARKO DPM (primary) + BPM (fallback) | EPM, LEBRON | DARKO CSV export confirmed on darko.app; BPM via basketball_reference_web_scraper as fallback for gap seasons |
 | Validation | Walk-forward chronological | Random k-fold | Prevents future data leaking into training; catches temporal regime shifts |
 | Elo prior | State-dependent weight decay | Static feature | Research showed state-dependent prior improved Brier from 0.1651→0.1606; natural prior decay is correct behaviour |
 | PBP parsing | `pbpstats` on top of V3 | Raw V3 only | V3 PBP has out-of-order shot/rebound events; pbpstats cleans this |
@@ -98,13 +98,23 @@ nba_api (PlayByPlayV2)
 | Live PBP (dashboard) | `nba_api` live endpoints | ScoreboardV3, PlayByPlay live |
 | Possession parsing | `pbpstats` | Cleans V3 out-of-order events; provides possession team ID |
 | Injury / availability | `nbainjuries` (PyPI 1.1.1) | 15-min updates since NBA Dec 2025 memo; historical back to 2021-22 |
-| Player impact (BPM) | `basketball_reference_web_scraper` | Free, programmatic, covers 2001–present |
+| Player impact (DARKO DPM) | `darko.app` CSV export | Primary; daily-updated projections; CSV export confirmed available |
+| Player impact (BPM fallback) | `basketball_reference_web_scraper` | Fallback for seasons not covered by DARKO CSV |
 | ESPN benchmark | ESPN summary `?event=` endpoint | Free; `winprobability` field; used for head-to-head evaluation |
 | Preseason smoke test | Same live stack | Preseason games only; excluded from training |
 
 ### DARKO investigation (Phase 0 finding)
 
-DARKO DPM is the top-ranked predictive player impact metric (RMSE 2.48 vs EPM 2.60 vs RAPTOR 2.63 vs BPM 2.71 in Snarr's 2020 retrodiction study). The original Shiny app went offline June 2026. The new home is `darko.app` (maintained by Kostya Medvedovsky) — fully functional as a web UI but **has no public download API or CSV export**. Scraping is possible but fragile and against ToS. **Decision: use BPM as our availability metric for V2. Revisit DARKO if API access opens up.**
+DARKO DPM is the top-ranked predictive player impact metric (RMSE 2.48 vs EPM 2.60 vs RAPTOR 2.63 vs BPM 2.71 in Snarr's 2020 retrodiction study). The original Shiny app went offline June 2026. The new home is `darko.app` (maintained by Kostya Medvedovsky).
+
+**CSV export is available on darko.app** — confirmed by manual inspection of the site. This makes DARKO viable as our primary player impact metric.
+
+**Decision: use DARKO DPM as the primary metric for `home_avail_delta` / `away_avail_delta`, with BPM from Basketball Reference as fallback for any historical seasons where DARKO coverage is incomplete.** The availability pipeline tries DARKO CSV first, falls back to BPM if the season is not covered.
+
+**Data access plan:**
+- Download DARKO CSV at the start of each season (automate if a stable URL pattern is confirmed)
+- Store as `data/darko_dpm_{season}.csv` in the V3 project folder
+- BPM scraped programmatically via `basketball_reference_web_scraper` for gap-filling
 
 ### nba_api migration note
 
@@ -312,11 +322,25 @@ Tasks:
 
 ---
 
+## Planned UI features (parked for later phases)
+
+### Rate that team — head-to-head popularity feature
+
+Inspired by DARKO's "rate that player" feature on darko.app. Two NBA teams are shown side by side and the user picks which team they prefer. Results are aggregated and displayed as a popularity ranking / head-to-head record.
+
+Planned for Layer 3 dashboard (playoff phase). Implementation ideas:
+- Elo-style rating system for team popularity (separate from the predictive Elo)
+- Store votes in SQLite (same predictions DB pattern as football)
+- Display on the NBA hub page as a sidebar widget: "Most popular teams this week"
+- Could extend to matchup previews — "Who are you rooting for?" before a game
+
+---
+
 ## Known issues and open questions
 
 | Issue | Status | Notes |
 |---|---|---|
-| DARKO DPM no API access | Open | Using BPM fallback. Check darko.app periodically for CSV export. |
+| DARKO DPM CSV access | Resolved | CSV export confirmed on darko.app. Download manually at season start; automate URL if pattern stabilises. BPM remains fallback. |
 | OT calibration | Open | Insufficient OT data even with regular season added. Will evaluate in fold results. |
 | 2019-20 bubble neutrality | Open | Home advantage invalid for bubble games. `is_bubble` flag added; model learns the effect. |
 | Garbage time / tanking | Open | Winsor ±60 mitigates. May need to discard snapshots with score_diff > 40 after Q3. |
