@@ -1,9 +1,9 @@
-## Phase 1 — Data Pipeline (2026-09-29 06:13 UTC)
+## Phase 1 — Data Pipeline (2026-09-29 06:18 UTC)
 
 - Seasons: 2018-19 → 2024-25
 - Total snapshots: 1,129,825
 - Unique games: 8,871
-- Features: 18  |  Target: home_team_won
+- Features: 16  |  Target: home_team_won
 - Home win rate: 0.5583 (55.8%)
 - Playoff rows: 6.5%
 - OT rows: 0.7%

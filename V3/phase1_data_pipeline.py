@@ -101,14 +101,16 @@ FEATURE_COLS = [
     "is_overtime",              # 8  — binary flag
     "lead_changes_norm",        # 9  — lead changes ÷ plays so far
     # New in V3
-    "possession",               # 10 — 1 = home has ball, 0 = away / unknown
-    "home_fts_pending",         # 11 — 0/1/2 free throws still to shoot
-    "away_fts_pending",         # 12 — same for away
-    "home_in_bonus",            # 13 — team fouls ≥ 5 in quarter
-    "away_in_bonus",            # 14 — same for away
-    "home_avail_delta",         # 15 — Σ(DPM × min) available vs expected, home
-    "away_avail_delta",         # 16 — same for away
-    "elo_prior_weight",         # 17 — state-dependent Elo decay
+    "possession",               # 10 — 1 = home scored (had ball), 0 = away scored
+    "home_in_bonus",            # 11 — away team has ≥5 fouls in quarter (home shoots FTs)
+    "away_in_bonus",            # 12 — home team has ≥5 fouls in quarter (away shoots FTs)
+    "home_avail_delta",         # 13 — Σ(DPM × min) available vs expected, home
+    "away_avail_delta",         # 14 — same for away
+    "elo_prior_weight",         # 15 — state-dependent Elo decay
+    # Note: home_fts_pending / away_fts_pending removed —
+    # FT sequences resolve before the next scored-play snapshot so these
+    # are almost always 0 at snapshot time. Bonus captures the relevant
+    # foul-situation context instead.
 ]
 TARGET_COL = "home_team_won"
 N_FEATURES = len(FEATURE_COLS)
@@ -593,11 +595,12 @@ def extract_snapshots(
     else:
         df["possession"] = 0.5
 
-    # ── Attach precomputed FT / bonus state from full PBP ────────────────────
-    df["home_fts_pending"] = df["_home_fts"].values
-    df["away_fts_pending"] = df["_away_fts"].values
-    df["home_in_bonus"]    = df["_home_bonus"].values
-    df["away_in_bonus"]    = df["_away_bonus"].values
+    # ── Attach precomputed bonus state from full PBP ─────────────────────────
+    # Note: home_fts_pending / away_fts_pending dropped from features —
+    # FT sequences resolve before the next scored-play snapshot so they
+    # are almost always 0. Bonus captures foul-situation context instead.
+    df["home_in_bonus"] = df["_home_bonus"].values
+    df["away_in_bonus"] = df["_away_bonus"].values
     df["score_diff"] = df["home_score"] - df["away_score"]
 
     lead_changes  = 0
@@ -714,13 +717,8 @@ def validate(df: pd.DataFrame) -> bool:
     for col in ["is_playoffs", "is_overtime", "possession",
                 "home_in_bonus", "away_in_bonus"]:
         chk(f"{col} is binary (0 or 1)",
-            df[col].isin([0, 1]).all(),
+            df[col].isin([0, 1, 0.0, 1.0]).all(),
             f"Unique values: {sorted(df[col].unique())[:5]}")
-
-    # 9. FT pending in [0, 2]
-    for col in ["home_fts_pending", "away_fts_pending"]:
-        chk(f"{col} in [0, 2]",
-            df[col].between(0, 2).all())
 
     # 10. elo_prior_weight in (0, 1)
     chk("elo_prior_weight in (0, 1)",
@@ -900,9 +898,18 @@ def main():
 
     if features_cache.exists() and not force_rebuild:
         print(f"\n[4/5] Loading cached features ({features_cache})...")
-        print("      (Pass --rebuild to re-extract from PBP files)")
         features_df = pd.read_parquet(features_cache)
-        print(f"      {len(features_df):,} snapshots loaded")
+        # Invalidate cache if feature set has changed
+        cached_cols = set(features_df.columns)
+        needed_cols = set(FEATURE_COLS + ["GAME_ID", "home_team_won"])
+        if not needed_cols.issubset(cached_cols):
+            missing = needed_cols - cached_cols
+            extra   = cached_cols - needed_cols
+            print(f"      Cache outdated (missing={missing}, extra={extra}) — rebuilding...")
+            force_rebuild = True
+        else:
+            print(f"      (Pass --rebuild to re-extract from PBP files)")
+            print(f"      {len(features_df):,} snapshots loaded")
     else:
         print("\n[4/5] Extracting PBP snapshots...")
         pbp_files      = list(DATA_PBP.glob("*.parquet"))
