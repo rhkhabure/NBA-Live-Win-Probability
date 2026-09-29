@@ -437,6 +437,7 @@ def fetch_pbp(game_id: str) -> pd.DataFrame | None:
 def extract_snapshots(
     pbp_df: pd.DataFrame,
     game_meta: pd.Series,
+    game_id: str = "",
     home_avail_delta: float = 0.0,
     away_avail_delta: float = 0.0,
 ) -> pd.DataFrame:
@@ -521,9 +522,11 @@ def extract_snapshots(
         df["possession"] = 0.5  # unknown — neutral
 
     # ── FT state ─────────────────────────────────────────────────────────────
-    # actionType = 'freethrow', subType = '1 of 2', '2 of 2', '1 of 1', etc.
-    action_col = "actiontype" if "actiontype" in col_map else None
-    sub_col    = "subtype"    if "subtype"    in col_map else None
+    # V3 actionType for free throws varies: 'Free Throw', 'freethrow', '3' (numeric)
+    # We match case-insensitively and also check description field as fallback
+    action_col = next((c for c in ("actiontype", "action_type", "eventmsgtype") if c in col_map), None)
+    sub_col    = next((c for c in ("subtype", "sub_type", "description") if c in col_map), None)
+    team_col   = next((c for c in ("teamid", "team_id") if c in col_map), None)
 
     home_fts = 0
     away_fts = 0
@@ -532,18 +535,25 @@ def extract_snapshots(
 
     if action_col and sub_col and team_col:
         for _, row in df.iterrows():
-            atype = str(row.get(action_col, "")).lower()
+            atype = str(row.get(action_col, "")).lower().replace(" ", "").replace("_", "")
             sub   = str(row.get(sub_col,    "")).lower()
             tid   = row.get(team_col)
 
-            if atype == "freethrow":
-                # Detect FT sequence: '1 of 2' means one more to come
-                if "1 of 2" in sub:
+            # Match 'freethrow', 'free throw', 'ft', eventmsgtype=3
+            is_ft = (
+                "freethrow" in atype or
+                atype == "3" or
+                ("free" in sub and "throw" in sub)
+            )
+
+            if is_ft:
+                # '1 of 2' or '1of2' → one more FT to come
+                if "1 of 2" in sub or "1of2" in sub or "1-of-2" in sub:
                     if tid == home_team_id:
                         home_fts = 1
                     else:
                         away_fts = 1
-                elif "2 of 2" in sub or "1 of 1" in sub:
+                elif any(x in sub for x in ("2 of 2","2of2","1 of 1","1of1","3 of 3","3of3")):
                     if tid == home_team_id:
                         home_fts = 0
                     else:
@@ -557,7 +567,7 @@ def extract_snapshots(
         df["away_fts_pending"] = 0
 
     # ── Bonus (team fouls ≥ 5 in quarter) ───────────────────────────────────
-    # actionType = 'foul', team committing foul = teamid
+    # V3 actionType for fouls: 'Foul', 'foul', 'personal', eventmsgtype=6
     home_fouls = 0
     away_fouls = 0
     home_bonus_list = []
@@ -566,7 +576,8 @@ def extract_snapshots(
 
     if action_col and team_col:
         for _, row in df.iterrows():
-            atype = str(row.get(action_col, "")).lower()
+            atype = str(row.get(action_col, "")).lower().replace(" ", "").replace("_", "")
+            sub   = str(row.get(sub_col, "")).lower() if sub_col else ""
             tid   = row.get(team_col)
             per   = row.get("period", 1)
 
@@ -576,14 +587,22 @@ def extract_snapshots(
                 away_fouls = 0
                 prev_period = per
 
-            if "foul" in atype:
+            # Match 'foul', 'personal', 'technical', eventmsgtype=6
+            is_foul = (
+                "foul" in atype or
+                atype == "6" or
+                "foul" in sub
+            )
+
+            if is_foul:
                 if tid == home_team_id:
                     home_fouls += 1
                 else:
                     away_fouls += 1
 
-            home_bonus_list.append(int(away_fouls >= 5))   # home is in bonus when AWAY has ≥5 fouls
-            away_bonus_list.append(int(home_fouls >= 5))   # away is in bonus when HOME has ≥5 fouls
+            # Home is in bonus when AWAY has ≥5 team fouls (and vice versa)
+            home_bonus_list.append(int(away_fouls >= 5))
+            away_bonus_list.append(int(home_fouls >= 5))
         df["home_in_bonus"] = home_bonus_list
         df["away_in_bonus"] = away_bonus_list
     else:
@@ -610,7 +629,7 @@ def extract_snapshots(
     df["lead_changes_norm"] = lc_list
 
     # ── Meta fields ──────────────────────────────────────────────────────────
-    df["GAME_ID"]        = game_meta["GAME_ID"]
+    df["GAME_ID"]        = game_id or str(game_meta.name)  # .name = the index value after set_index
     df["home_team_won"]  = int(game_meta["home_team_won"])
     df["home_elo"]       = float(game_meta["home_elo"])
     df["away_elo"]       = float(game_meta["away_elo"])
@@ -725,10 +744,18 @@ def validate(df: pd.DataFrame) -> bool:
         df["quarter_time_elapsed_pct"].between(0.0, 1.0).all())
 
     # 12. Zero-variance check
+    # Note: home_avail_delta / away_avail_delta are intentionally 0.0
+    # until DARKO CSV is downloaded — exclude from hard failure
+    known_zero_ok = {"home_avail_delta", "away_avail_delta"}
     low_var = [c for c in FEATURE_COLS if df[c].std() < 1e-6]
-    chk("All features have meaningful variance",
-        len(low_var) == 0,
-        f"Zero-variance features: {low_var}" if low_var else "")
+    unexpected_zero = [c for c in low_var if c not in known_zero_ok]
+    chk("All non-avail features have meaningful variance",
+        len(unexpected_zero) == 0,
+        f"Zero-variance (unexpected): {unexpected_zero}" if unexpected_zero else
+        f"Note: avail_delta = 0.0 until DARKO CSV loaded (expected)" if low_var else "")
+    if unexpected_zero:
+        print("      Running column diagnostic...")
+        diagnose_pbp_columns(DATA_PBP)
 
     # 13. Group-aware — check game count and split feasibility
     n_games = df["GAME_ID"].nunique()
@@ -756,7 +783,39 @@ def validate(df: pd.DataFrame) -> bool:
 # Live test against a real preseason game to confirm V3 pipeline works end-to-end
 # ─────────────────────────────────────────────────────────────────────────────
 
-def smoke_test_live(game_id: str | None = None):
+def diagnose_pbp_columns(pbp_dir: Path, n_samples: int = 3):
+    """
+    Read a few cached PBP files and print the actual column names
+    and sample actionType values so we know the correct V3 field names.
+    Called automatically if zero-variance features are detected.
+    """
+    files = list(pbp_dir.glob("*.parquet"))[:n_samples]
+    if not files:
+        print("[diag] No PBP files found to inspect")
+        return
+
+    print("\n[diag] Inspecting V3 PBP column names and action types...")
+    for fpath in files:
+        df = pd.read_parquet(fpath)
+        df.columns = df.columns.str.lower()
+        print(f"\n  File: {fpath.stem}")
+        print(f"  Columns: {list(df.columns)}")
+
+        # Action type values — what do foul/FT events look like?
+        for col in ["actiontype", "action_type", "eventmsgtype"]:
+            if col in df.columns:
+                vals = df[col].dropna().unique()
+                print(f"  {col} unique values ({len(vals)}): {sorted(str(v) for v in vals)[:20]}")
+
+        for col in ["subtype", "sub_type", "description"]:
+            if col in df.columns:
+                # Sample FT-related rows
+                mask = df[col].astype(str).str.lower().str.contains("free|ft|foul", na=False)
+                sample = df[mask][[col] + [c for c in ["actiontype","teamid"] if c in df.columns]].head(5)
+                if not sample.empty:
+                    print(f"  FT/foul sample ({col}):")
+                    print(sample.to_string(index=False))
+                break
     """
     Fetch a live or recent preseason game and run it through the pipeline.
     If game_id is None, tries to find today's first game via ScoreboardV2.
@@ -800,7 +859,7 @@ def smoke_test_live(game_id: str | None = None):
         "is_playoffs": 0,
     })
 
-    snaps = extract_snapshots(pbp_df, meta)
+    snaps = extract_snapshots(pbp_df, meta, game_id)
     if snaps.empty:
         print(f"[smoke] No snapshots extracted — check V3 column names")
         print(f"        Columns in PBP: {list(pbp_df.columns)}")
@@ -848,73 +907,80 @@ def main():
     player_impact = load_player_impact()
 
     # ── Step 4: PBP → snapshots ──────────────────────────────────────────────
-    print("\n[4/5] Extracting PBP snapshots...")
-    pbp_files      = list(DATA_PBP.glob("*.parquet"))
-    game_ids_needed = set(games_idx.index)
+    features_cache = DATA_PROC / "features_v3.parquet"
+    force_rebuild  = "--rebuild" in sys.argv
 
-    # Fetch any missing PBP files
-    game_ids_cached = {f.stem for f in pbp_files}
-    game_ids_missing = game_ids_needed - game_ids_cached
-    if game_ids_missing:
-        print(f"      Fetching {len(game_ids_missing):,} missing PBP files...")
-        for gid in tqdm(sorted(game_ids_missing), desc="Fetching PBP"):
-            fetch_pbp(gid)
+    if features_cache.exists() and not force_rebuild:
+        print(f"\n[4/5] Loading cached features ({features_cache})...")
+        print("      (Pass --rebuild to re-extract from PBP files)")
+        features_df = pd.read_parquet(features_cache)
+        print(f"      {len(features_df):,} snapshots loaded")
+    else:
+        print("\n[4/5] Extracting PBP snapshots...")
+        pbp_files      = list(DATA_PBP.glob("*.parquet"))
+        game_ids_needed = set(games_idx.index)
 
-    # Build feature dataset from cached PBP
-    pbp_files     = list(DATA_PBP.glob("*.parquet"))
-    all_snapshots = []
-    skipped       = 0
-    empty_pbp     = 0
-    errors        = 0
+        # Fetch any missing PBP files
+        game_ids_cached = {f.stem for f in pbp_files}
+        game_ids_missing = game_ids_needed - game_ids_cached
+        if game_ids_missing:
+            print(f"      Fetching {len(game_ids_missing):,} missing PBP files...")
+            for gid in tqdm(sorted(game_ids_missing), desc="Fetching PBP"):
+                fetch_pbp(gid)
 
-    print(f"      Processing {len(pbp_files):,} PBP files...")
-    for fpath in tqdm(pbp_files, desc="Extracting features"):
-        game_id = fpath.stem
-        if game_id not in game_ids_needed:
-            skipped += 1
-            continue
-        try:
-            pbp_raw   = pd.read_parquet(fpath)
-            game_meta = games_idx.loc[game_id]
-            h_delta, a_delta = compute_avail_delta(
-                game_id,
-                game_meta["home_team_id"],
-                game_meta["away_team_id"],
-                game_meta["SEASON"],
-                player_impact,
-            )
-            snaps = extract_snapshots(pbp_raw, game_meta, h_delta, a_delta)
-            if snaps.empty:
-                empty_pbp += 1
-            else:
-                all_snapshots.append(snaps)
-        except Exception as e:
-            errors += 1
-            if errors <= 5:
-                print(f"  [ERROR] {game_id}: {e}")
+        # Build feature dataset from cached PBP
+        pbp_files     = list(DATA_PBP.glob("*.parquet"))
+        all_snapshots = []
+        skipped       = 0
+        empty_pbp     = 0
+        errors        = 0
 
-    if not all_snapshots:
-        raise RuntimeError("No snapshots extracted — check PBP data and column names")
+        print(f"      Processing {len(pbp_files):,} PBP files...")
+        for fpath in tqdm(pbp_files, desc="Extracting features"):
+            game_id = fpath.stem
+            if game_id not in game_ids_needed:
+                skipped += 1
+                continue
+            try:
+                pbp_raw   = pd.read_parquet(fpath)
+                game_meta = games_idx.loc[game_id]
+                h_delta, a_delta = compute_avail_delta(
+                    game_id,
+                    game_meta["home_team_id"],
+                    game_meta["away_team_id"],
+                    game_meta["SEASON"],
+                    player_impact,
+                )
+                snaps = extract_snapshots(pbp_raw, game_meta, game_id, h_delta, a_delta)
+                if snaps.empty:
+                    empty_pbp += 1
+                else:
+                    all_snapshots.append(snaps)
+            except Exception as e:
+                errors += 1
+                if errors <= 5:
+                    print(f"  [ERROR] {game_id}: {e}")
 
-    features_df = pd.concat(all_snapshots, ignore_index=True)
+        if not all_snapshots:
+            raise RuntimeError("No snapshots extracted — check PBP data and column names")
 
-    print(f"\n      Skipped (no meta) : {skipped:,}")
-    print(f"      Empty PBP         : {empty_pbp:,}")
-    print(f"      Errors            : {errors:,}")
-    print(f"      Snapshots total   : {len(features_df):,}")
+        features_df = pd.concat(all_snapshots, ignore_index=True)
 
-    # ── Winsorise score_diff ─────────────────────────────────────────────────
-    n_clipped = (features_df["score_diff"].abs() >= SCORE_DIFF_CLIP).sum()
-    features_df["score_diff"] = features_df["score_diff"].clip(
-        -SCORE_DIFF_CLIP, SCORE_DIFF_CLIP
-    )
-    print(f"      Winsorised ±{SCORE_DIFF_CLIP:.0f}: {n_clipped:,} rows clipped")
+        print(f"\n      Skipped (no meta) : {skipped:,}")
+        print(f"      Empty PBP         : {empty_pbp:,}")
+        print(f"      Errors            : {errors:,}")
+        print(f"      Snapshots total   : {len(features_df):,}")
 
-    # ── Step 5: Save and validate ────────────────────────────────────────────
-    print("\n[5/5] Saving and validating...")
-    out_path = DATA_PROC / "features_v3.parquet"
-    features_df.to_parquet(out_path, index=False)
-    print(f"      Saved → {out_path}  ({out_path.stat().st_size / 1e6:.1f} MB)")
+        # Winsorise score_diff
+        n_clipped = (features_df["score_diff"].abs() >= SCORE_DIFF_CLIP).sum()
+        features_df["score_diff"] = features_df["score_diff"].clip(
+            -SCORE_DIFF_CLIP, SCORE_DIFF_CLIP
+        )
+        print(f"      Winsorised +/-{SCORE_DIFF_CLIP:.0f}: {n_clipped:,} rows clipped")
+
+        # Save
+        features_df.to_parquet(features_cache, index=False)
+        print(f"      Saved -> {features_cache}  ({features_cache.stat().st_size / 1e6:.1f} MB)")
 
     ok = validate(features_df)
 
@@ -931,11 +997,11 @@ def main():
 - Playoff rows: {features_df["is_playoffs"].mean():.1%}
 - OT rows: {features_df["is_overtime"].mean():.1%}
 - Possession=home: {features_df["possession"].mean():.3f}
-- Saved to: {out_path}
+- Saved to: {features_cache}
 - Validation: {"PASS" if ok else "FAIL"}
 """
     report_path = DATA_RES / "phase1_report.md"
-    report_path.write_text(report)
+    report_path.write_text(report, encoding="utf-8")
     print(f"\n[done] Report → {report_path}")
     print(f"[done] Status : {'✅ ALL CHECKS PASSED' if ok else '❌ SOME CHECKS FAILED'}")
 
