@@ -462,149 +462,142 @@ def extract_snapshots(
     df.columns = df.columns.str.lower()
     col_map    = {c: c for c in df.columns}
 
-    # Score columns (split in V3)
-    has_split = "scorehome" in col_map and "scoreaway" in col_map
-    if has_split:
-        df = df[
-            df["scorehome"].notna() & df["scoreaway"].notna() &
-            (df["scorehome"].astype(str).str.strip() != "") &
-            (df["scoreaway"].astype(str).str.strip() != "")
-        ].copy()
-        if df.empty:
-            return pd.DataFrame()
-        df["home_score"] = pd.to_numeric(df["scorehome"], errors="coerce")
-        df["away_score"] = pd.to_numeric(df["scoreaway"], errors="coerce")
-    elif "score" in col_map:
-        df = df[df["score"].notna()].copy()
-        if df.empty:
-            return pd.DataFrame()
-        parsed = df["score"].apply(lambda s: pd.Series(parse_score(s), index=["home_score", "away_score"]))
-        df = pd.concat([df.reset_index(drop=True), parsed.reset_index(drop=True)], axis=1)
-    else:
-        return pd.DataFrame()   # No score data available
-
-    df = df.dropna(subset=["home_score", "away_score"])
-    if df.empty:
-        return pd.DataFrame()
-
-    df["home_score"] = df["home_score"].astype(int)
-    df["away_score"] = df["away_score"].astype(int)
-
-    # ── Clock and period ─────────────────────────────────────────────────────
+    # Resolve key column names
+    action_col = next((c for c in ("actiontype", "action_type") if c in col_map), None)
+    sub_col    = next((c for c in ("subtype", "sub_type", "description") if c in col_map), None)
+    team_col   = next((c for c in ("teamid", "team_id") if c in col_map), None)
     clock_col  = next((c for c in ("clock", "pctimestring") if c in col_map), None)
     period_col = next((c for c in ("period", "quarter") if c in col_map), None)
+    order_col  = next((c for c in ("actionnumber", "actionid", "ordernumber") if c in col_map), None)
 
     if not clock_col or not period_col:
         return pd.DataFrame()
 
-    df["clock_sec"] = df[clock_col].apply(parse_game_clock)
-    df["period"]    = df[period_col].astype(int)
-    df["time_remaining_sec"] = df.apply(
-        lambda r: period_to_time_remaining(r["period"], r["clock_sec"]), axis=1
-    )
-    df["is_overtime"]  = (df["period"] >= 5).astype(int)
-
-    # Quarter time elapsed: fraction of this period that has elapsed
-    period_len = 720.0  # 12 min regulation, 5 min OT — use 300 for OT
-    df["quarter_time_elapsed_pct"] = df.apply(
-        lambda r: 1.0 - min(r["clock_sec"] / (300.0 if r["period"] >= 5 else 720.0), 1.0),
-        axis=1,
-    )
-
-    # ── Possession ───────────────────────────────────────────────────────────
-    # In V3, 'teamid' on a scored play = the team that scored
-    # possession BEFORE the score = the team that scored
     home_team_id = game_meta["home_team_id"]
-    team_col     = "teamid" if "teamid" in col_map else None
-    if team_col:
-        df["possession"] = (df[team_col] == home_team_id).astype(float)
-    else:
-        df["possession"] = 0.5  # unknown — neutral
 
-    # ── FT state ─────────────────────────────────────────────────────────────
-    # V3 confirmed: actiontype = 'Free Throw', subtype = 'Free Throw 1 of 2' etc.
-    action_col = next((c for c in ("actiontype", "action_type", "eventmsgtype") if c in col_map), None)
-    sub_col    = next((c for c in ("subtype", "sub_type", "description") if c in col_map), None)
-    team_col   = next((c for c in ("teamid", "team_id") if c in col_map), None)
+    # ── STEP A: Compute FT state and bonus on the FULL PBP (all event types) ──
+    # This must happen BEFORE score-filtering because FT/foul events have no score.
+    # We build per-row state, then forward-fill onto scored plays.
 
-    home_fts = 0
-    away_fts = 0
-    home_fts_list = []
-    away_fts_list = []
+    full = df.copy()
+    full["_period"] = pd.to_numeric(full[period_col], errors="coerce").fillna(1).astype(int)
+    if order_col:
+        full = full.sort_values(order_col).reset_index(drop=True)
 
-    if action_col and sub_col and team_col:
-        for _, row in df.iterrows():
-            atype = str(row.get(action_col, ""))   # keep original case
-            sub   = str(row.get(sub_col,    ""))   # 'Free Throw 1 of 2'
+    home_fts   = 0
+    away_fts   = 0
+    home_fouls = 0
+    away_fouls = 0
+    prev_per   = None
+
+    ft_home_list   = []
+    ft_away_list   = []
+    bon_home_list  = []
+    bon_away_list  = []
+
+    if action_col and team_col:
+        for _, row in full.iterrows():
+            atype = str(row.get(action_col, ""))
+            sub   = str(row.get(sub_col, "")) if sub_col else ""
             tid   = row.get(team_col)
+            per   = int(row.get("_period", 1))
 
-            # V3: actiontype == 'Free Throw'
-            is_ft = (atype == "Free Throw")
+            # Reset team fouls on new quarter
+            if per != prev_per:
+                home_fouls = 0
+                away_fouls = 0
+                prev_per   = per
 
-            if is_ft:
-                # subtype is 'Free Throw 1 of 2', 'Free Throw 2 of 2', etc.
+            # FT state — V3: actiontype == 'Free Throw'
+            if atype == "Free Throw":
                 if "1 of 2" in sub or "1 of 3" in sub:
                     if tid == home_team_id:
                         home_fts = 1
                     else:
                         away_fts = 1
-                elif "2 of 2" in sub or "1 of 1" in sub or "2 of 3" in sub or "3 of 3" in sub:
+                elif any(x in sub for x in ("2 of 2", "1 of 1", "2 of 3", "3 of 3")):
                     if tid == home_team_id:
                         home_fts = 0
                     else:
                         away_fts = 0
-            home_fts_list.append(home_fts)
-            away_fts_list.append(away_fts)
-        df["home_fts_pending"] = home_fts_list
-        df["away_fts_pending"] = away_fts_list
-    else:
-        df["home_fts_pending"] = 0
-        df["away_fts_pending"] = 0
 
-    # ── Bonus (team fouls >= 5 in quarter) ───────────────────────────────────
-    # V3 confirmed: actiontype = 'Foul' (title case)
-    home_fouls = 0
-    away_fouls = 0
-    home_bonus_list = []
-    away_bonus_list = []
-    prev_period = None
-
-    if action_col and team_col:
-        for _, row in df.iterrows():
-            atype = str(row.get(action_col, ""))   # 'Foul', 'Free Throw', etc.
-            tid   = row.get(team_col)
-            per   = row.get("period", 1)
-            sub   = str(row.get(sub_col, "")).lower() if sub_col else ""
-
-            # Reset on new quarter
-            if per != prev_period:
-                home_fouls = 0
-                away_fouls = 0
-                prev_period = per
-
-            # V3: actiontype == 'Foul'; exclude offensive foul turnovers
-            # (those are turnovers in V3, not tracked as team fouls for bonus)
-            is_foul = (
-                atype == "Foul" and
-                "offensive foul turnover" not in sub
-            )
-
-            if is_foul:
+            # Bonus — V3: actiontype == 'Foul'; exclude offensive foul turnovers
+            if atype == "Foul" and "Offensive Foul Turnover" not in sub:
                 if tid == home_team_id:
                     home_fouls += 1
                 else:
                     away_fouls += 1
 
-            # Home is in bonus when AWAY has >=5 team fouls (and vice versa)
-            home_bonus_list.append(int(away_fouls >= 5))
-            away_bonus_list.append(int(home_fouls >= 5))
-        df["home_in_bonus"] = home_bonus_list
-        df["away_in_bonus"] = away_bonus_list
+            ft_home_list.append(home_fts)
+            ft_away_list.append(away_fts)
+            bon_home_list.append(int(away_fouls >= 5))   # home in bonus when AWAY has ≥5
+            bon_away_list.append(int(home_fouls >= 5))   # away in bonus when HOME has ≥5
     else:
-        df["home_in_bonus"] = 0
-        df["away_in_bonus"] = 0
+        ft_home_list  = [0] * len(full)
+        ft_away_list  = [0] * len(full)
+        bon_home_list = [0] * len(full)
+        bon_away_list = [0] * len(full)
 
-    # ── Score diff and lead changes ──────────────────────────────────────────
+    full["_home_fts"]   = ft_home_list
+    full["_away_fts"]   = ft_away_list
+    full["_home_bonus"] = bon_home_list
+    full["_away_bonus"] = bon_away_list
+
+    # ── STEP B: Filter to scored plays only ──────────────────────────────────
+    has_split = "scorehome" in col_map and "scoreaway" in col_map
+    if has_split:
+        scored = full[
+            full["scorehome"].notna() & full["scoreaway"].notna() &
+            (full["scorehome"].astype(str).str.strip() != "") &
+            (full["scoreaway"].astype(str).str.strip() != "")
+        ].copy()
+        if scored.empty:
+            return pd.DataFrame()
+        scored["home_score"] = pd.to_numeric(scored["scorehome"], errors="coerce")
+        scored["away_score"] = pd.to_numeric(scored["scoreaway"], errors="coerce")
+    elif "score" in col_map:
+        scored = full[full["score"].notna()].copy()
+        if scored.empty:
+            return pd.DataFrame()
+        parsed = scored["score"].apply(
+            lambda s: pd.Series(parse_score(s), index=["home_score", "away_score"])
+        )
+        scored = pd.concat([scored.reset_index(drop=True), parsed.reset_index(drop=True)], axis=1)
+    else:
+        return pd.DataFrame()
+
+    scored = scored.dropna(subset=["home_score", "away_score"])
+    if scored.empty:
+        return pd.DataFrame()
+
+    scored["home_score"] = scored["home_score"].astype(int)
+    scored["away_score"] = scored["away_score"].astype(int)
+    df = scored  # work on scored-plays-only from here
+
+    # ── Clock, period, time features on scored plays ─────────────────────────
+    df = df.copy()
+    df["clock_sec"] = df[clock_col].apply(parse_game_clock)
+    df["period"]    = pd.to_numeric(df[period_col], errors="coerce").fillna(1).astype(int)
+    df["time_remaining_sec"] = df.apply(
+        lambda r: period_to_time_remaining(r["period"], r["clock_sec"]), axis=1
+    )
+    df["is_overtime"] = (df["period"] >= 5).astype(int)
+    df["quarter_time_elapsed_pct"] = df.apply(
+        lambda r: 1.0 - min(r["clock_sec"] / (300.0 if r["period"] >= 5 else 720.0), 1.0),
+        axis=1,
+    )
+
+    # ── Possession (scored play: team that scored had the ball) ──────────────
+    if team_col and team_col in df.columns:
+        df["possession"] = (df[team_col] == home_team_id).astype(float)
+    else:
+        df["possession"] = 0.5
+
+    # ── Attach precomputed FT / bonus state from full PBP ────────────────────
+    df["home_fts_pending"] = df["_home_fts"].values
+    df["away_fts_pending"] = df["_away_fts"].values
+    df["home_in_bonus"]    = df["_home_bonus"].values
+    df["away_in_bonus"]    = df["_away_bonus"].values
     df["score_diff"] = df["home_score"] - df["away_score"]
 
     lead_changes  = 0
