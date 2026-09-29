@@ -522,8 +522,7 @@ def extract_snapshots(
         df["possession"] = 0.5  # unknown — neutral
 
     # ── FT state ─────────────────────────────────────────────────────────────
-    # V3 actionType for free throws varies: 'Free Throw', 'freethrow', '3' (numeric)
-    # We match case-insensitively and also check description field as fallback
+    # V3 confirmed: actiontype = 'Free Throw', subtype = 'Free Throw 1 of 2' etc.
     action_col = next((c for c in ("actiontype", "action_type", "eventmsgtype") if c in col_map), None)
     sub_col    = next((c for c in ("subtype", "sub_type", "description") if c in col_map), None)
     team_col   = next((c for c in ("teamid", "team_id") if c in col_map), None)
@@ -535,25 +534,21 @@ def extract_snapshots(
 
     if action_col and sub_col and team_col:
         for _, row in df.iterrows():
-            atype = str(row.get(action_col, "")).lower().replace(" ", "").replace("_", "")
-            sub   = str(row.get(sub_col,    "")).lower()
+            atype = str(row.get(action_col, ""))   # keep original case
+            sub   = str(row.get(sub_col,    ""))   # 'Free Throw 1 of 2'
             tid   = row.get(team_col)
 
-            # Match 'freethrow', 'free throw', 'ft', eventmsgtype=3
-            is_ft = (
-                "freethrow" in atype or
-                atype == "3" or
-                ("free" in sub and "throw" in sub)
-            )
+            # V3: actiontype == 'Free Throw'
+            is_ft = (atype == "Free Throw")
 
             if is_ft:
-                # '1 of 2' or '1of2' → one more FT to come
-                if "1 of 2" in sub or "1of2" in sub or "1-of-2" in sub:
+                # subtype is 'Free Throw 1 of 2', 'Free Throw 2 of 2', etc.
+                if "1 of 2" in sub or "1 of 3" in sub:
                     if tid == home_team_id:
                         home_fts = 1
                     else:
                         away_fts = 1
-                elif any(x in sub for x in ("2 of 2","2of2","1 of 1","1of1","3 of 3","3of3")):
+                elif "2 of 2" in sub or "1 of 1" in sub or "2 of 3" in sub or "3 of 3" in sub:
                     if tid == home_team_id:
                         home_fts = 0
                     else:
@@ -566,8 +561,8 @@ def extract_snapshots(
         df["home_fts_pending"] = 0
         df["away_fts_pending"] = 0
 
-    # ── Bonus (team fouls ≥ 5 in quarter) ───────────────────────────────────
-    # V3 actionType for fouls: 'Foul', 'foul', 'personal', eventmsgtype=6
+    # ── Bonus (team fouls >= 5 in quarter) ───────────────────────────────────
+    # V3 confirmed: actiontype = 'Foul' (title case)
     home_fouls = 0
     away_fouls = 0
     home_bonus_list = []
@@ -576,10 +571,10 @@ def extract_snapshots(
 
     if action_col and team_col:
         for _, row in df.iterrows():
-            atype = str(row.get(action_col, "")).lower().replace(" ", "").replace("_", "")
-            sub   = str(row.get(sub_col, "")).lower() if sub_col else ""
+            atype = str(row.get(action_col, ""))   # 'Foul', 'Free Throw', etc.
             tid   = row.get(team_col)
             per   = row.get("period", 1)
+            sub   = str(row.get(sub_col, "")).lower() if sub_col else ""
 
             # Reset on new quarter
             if per != prev_period:
@@ -587,11 +582,11 @@ def extract_snapshots(
                 away_fouls = 0
                 prev_period = per
 
-            # Match 'foul', 'personal', 'technical', eventmsgtype=6
+            # V3: actiontype == 'Foul'; exclude offensive foul turnovers
+            # (those are turnovers in V3, not tracked as team fouls for bonus)
             is_foul = (
-                "foul" in atype or
-                atype == "6" or
-                "foul" in sub
+                atype == "Foul" and
+                "offensive foul turnover" not in sub
             )
 
             if is_foul:
@@ -600,7 +595,7 @@ def extract_snapshots(
                 else:
                     away_fouls += 1
 
-            # Home is in bonus when AWAY has ≥5 team fouls (and vice versa)
+            # Home is in bonus when AWAY has >=5 team fouls (and vice versa)
             home_bonus_list.append(int(away_fouls >= 5))
             away_bonus_list.append(int(home_fouls >= 5))
         df["home_in_bonus"] = home_bonus_list
@@ -785,8 +780,7 @@ def validate(df: pd.DataFrame) -> bool:
 
 def diagnose_pbp_columns(pbp_dir: Path, n_samples: int = 3):
     """
-    Read a few cached PBP files and print the actual column names
-    and sample actionType values so we know the correct V3 field names.
+    Read a few cached PBP files and print actual column names and action types.
     Called automatically if zero-variance features are detected.
     """
     files = list(pbp_dir.glob("*.parquet"))[:n_samples]
@@ -801,7 +795,6 @@ def diagnose_pbp_columns(pbp_dir: Path, n_samples: int = 3):
         print(f"\n  File: {fpath.stem}")
         print(f"  Columns: {list(df.columns)}")
 
-        # Action type values — what do foul/FT events look like?
         for col in ["actiontype", "action_type", "eventmsgtype"]:
             if col in df.columns:
                 vals = df[col].dropna().unique()
@@ -809,16 +802,18 @@ def diagnose_pbp_columns(pbp_dir: Path, n_samples: int = 3):
 
         for col in ["subtype", "sub_type", "description"]:
             if col in df.columns:
-                # Sample FT-related rows
                 mask = df[col].astype(str).str.lower().str.contains("free|ft|foul", na=False)
-                sample = df[mask][[col] + [c for c in ["actiontype","teamid"] if c in df.columns]].head(5)
+                sample = df[mask][[col] + [c for c in ["actiontype", "teamid"] if c in df.columns]].head(5)
                 if not sample.empty:
                     print(f"  FT/foul sample ({col}):")
                     print(sample.to_string(index=False))
                 break
+
+
+def smoke_test_live(game_id: str | None = None):
     """
     Fetch a live or recent preseason game and run it through the pipeline.
-    If game_id is None, tries to find today's first game via ScoreboardV2.
+    If game_id is None, tries to find today's first game via the live scoreboard.
     Prints a sample of feature rows — not saved to training data.
     """
     from nba_api.live.nba.endpoints import scoreboard
