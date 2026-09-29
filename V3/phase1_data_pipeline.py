@@ -731,7 +731,8 @@ def validate(df: pd.DataFrame) -> bool:
 
     # 12. Zero-variance check
     # Note: home_avail_delta / away_avail_delta are intentionally 0.0
-    # until DARKO CSV is downloaded — exclude from hard failure
+    # until DARKO CSV is downloaded — exclude from hard failure.
+    # All other features must have real variance.
     known_zero_ok = {"home_avail_delta", "away_avail_delta"}
     low_var = [c for c in FEATURE_COLS if df[c].std() < 1e-6]
     unexpected_zero = [c for c in low_var if c not in known_zero_ok]
@@ -900,12 +901,12 @@ def main():
         print(f"\n[4/5] Loading cached features ({features_cache})...")
         features_df = pd.read_parquet(features_cache)
         # Invalidate cache if feature set has changed
-        cached_cols = set(features_df.columns)
-        needed_cols = set(FEATURE_COLS + ["GAME_ID", "home_team_won"])
-        if not needed_cols.issubset(cached_cols):
-            missing = needed_cols - cached_cols
-            extra   = cached_cols - needed_cols
-            print(f"      Cache outdated (missing={missing}, extra={extra}) — rebuilding...")
+        cached_feat_cols = [c for c in FEATURE_COLS if c in features_df.columns]
+        if len(cached_feat_cols) != N_FEATURES:
+            print(f"      Cache outdated ({len(cached_feat_cols)} of {N_FEATURES} features present) — rebuilding...")
+            force_rebuild = True
+        elif "GAME_ID" not in features_df.columns or TARGET_COL not in features_df.columns:
+            print(f"      Cache missing required columns — rebuilding...")
             force_rebuild = True
         else:
             print(f"      (Pass --rebuild to re-extract from PBP files)")
