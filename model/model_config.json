@@ -1,0 +1,79 @@
+{
+  "model_config": {
+    "n_features": 16,
+    "hidden_dims": [
+      128,
+      64,
+      32
+    ],
+    "dropout": 0.25,
+    "use_batchnorm": true
+  },
+  "feature_cols": [
+    "score_diff",
+    "time_remaining_sec",
+    "quarter",
+    "quarter_time_elapsed_pct",
+    "home_elo",
+    "away_elo",
+    "elo_diff",
+    "is_playoffs",
+    "is_overtime",
+    "lead_changes_norm",
+    "possession",
+    "home_in_bonus",
+    "away_in_bonus",
+    "home_avail_delta",
+    "away_avail_delta",
+    "elo_prior_weight"
+  ],
+  "target_col": "home_team_won",
+  "temperature": 1.0034378561883004,
+  "train_metrics": {
+    "best_epoch": 23,
+    "epochs_run": 38
+  },
+  "val_metrics": {
+    "roc_auc": 0.8564828022143361,
+    "pr_auc": 0.8808163717744443,
+    "brier": 0.15506711602210999,
+    "brier_skill": 0.3745541621469839,
+    "log_loss": 0.4618537425994873,
+    "accuracy": 0.7621620326557016
+  },
+  "walk_forward": [
+    {
+      "fold": 1,
+      "train": "['2018-19', '2019-20', '2020-21', '2021-22']",
+      "test": "2022-23",
+      "brier": 0.16629935801029205,
+      "roc_auc": 0.8324030292582998,
+      "bss": 0.31686577150848616,
+      "logloss": 0.4913215935230255,
+      "T": 1.015198956983048,
+      "n_test": 171070
+    },
+    {
+      "fold": 2,
+      "train": "['2018-19', '2019-20', '2020-21', '2021-22', '2022-23']",
+      "test": "2023-24",
+      "brier": 0.14907892048358917,
+      "roc_auc": 0.8661120002024312,
+      "bss": 0.39824586064289214,
+      "logloss": 0.4489764869213104,
+      "T": 1.0122489996276713,
+      "n_test": 167957
+    },
+    {
+      "fold": 3,
+      "train": "['2018-19', '2019-20', '2020-21', '2021-22', '2022-23', '2023-24']",
+      "test": "2024-25",
+      "brier": 0.15540160238742828,
+      "roc_auc": 0.8552978859569531,
+      "bss": 0.3732050488702716,
+      "logloss": 0.46260011196136475,
+      "T": 0.9534277036847911,
+      "n_test": 166954
+    }
+  ]
+}

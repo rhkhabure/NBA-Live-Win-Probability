@@ -1,4 +1,4 @@
-## Phase 2 — Training (2026-09-29 08:33 UTC)
+## Phase 2 — Training (2026-09-29 12:00 UTC)
 
 ### Architecture
 - Input: 16 features
@@ -13,7 +13,7 @@
     2 2023-24 0.149079 0.866112 0.398246 1.012249
     3 2024-25 0.155402 0.855298 0.373205 0.953428
 
-Brier drift: 0.0172
+Brier drift: -0.0109
 
 ### Final model performance (2024-25 validation)
 - ROC-AUC      : 0.8565
@@ -25,7 +25,7 @@ Brier drift: 0.0172
 - Temperature T: 1.003438
 - Pathwise rate: 0.095 (target 0.08-0.15)
 
-### Validation gates: 7/8 passed
+### Validation gates: 8/8 passed
 
 ### ESPN benchmark
 ESPN head-to-head: PENDING — requires nba_api→ESPN game ID mapping.
