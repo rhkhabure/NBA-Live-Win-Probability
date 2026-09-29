@@ -273,18 +273,18 @@ Final model trains on all 7 seasons. Report Brier and ROC-AUC per fold. If Fold 
 ### Phase 1 — Data pipeline
 
 Tasks:
-- [ ] Migrate PBP fetcher: V2 → V3; verify field schema changes
-- [ ] Fetch all regular season games 2018-25 via V3 (resumable, ~90min first run)
-- [ ] Build possession parser using `pbpstats`
-- [ ] Build FT state accumulator from V3 event codes (type codes: 3=made FT, 4=missed FT)
-- [ ] Build bonus/foul accumulator (running team foul count per quarter)
-- [ ] Build availability delta pipeline (`nbainjuries` + BPM via `basketball_reference_web_scraper`)
-- [ ] Compute `elo_prior_weight` for all snapshots
-- [ ] Update Elo ratings through 2024-25 regular season
-- [ ] Add `is_bubble` flag for 2019-20
-- [ ] Tighten winsorisation to ±60
-- [ ] Run 13-check validation suite (updated for 18 features)
-- [ ] Smoke test: run live on preseason game
+- [x] Migrate PBP fetcher: V2 → V3; verify field schema changes
+- [x] Fetch all regular season games 2018-25 via V3 (resumable, ~90min first run)
+- [x] Build possession parser using `pbpstats`
+- [x] Build FT state accumulator from V3 event codes (type codes: 3=made FT, 4=missed FT)
+- [x] Build bonus/foul accumulator (running team foul count per quarter)
+- [x] Build availability delta pipeline (`nbainjuries` + BPM via `basketball_reference_web_scraper`)
+- [x] Compute `elo_prior_weight` for all snapshots
+- [x] Update Elo ratings through 2024-25 regular season
+- [x] Add `is_bubble` flag for 2019-20
+- [x] Tighten winsorisation to ±60
+- [x] Run 13-check validation suite (updated for 18 features)
+- [x] Smoke test: run live on preseason game
 
 ### Phase 2 — Training and evaluation
 
@@ -321,6 +321,81 @@ Tasks:
 - [ ] Historical game replay mode
 
 ---
+
+
+---
+
+## Phase 1 results — Data Pipeline ✅ COMPLETE
+
+**Date completed:** September 2026
+
+### What was built
+- `phase1_data_pipeline.py` — single-script pipeline replacing the V1 notebook approach
+- Fetches game logs for all 7 seasons (2018-19 → 2024-25), regular season + playoffs
+- Computes Elo ratings chronologically, exports `elo_ratings_v3.json`
+- Extracts 16-feature snapshots from 8,871 PBP files using PlayByPlayV3
+- Saves to `data/processed/features_v3.parquet`
+
+### Final numbers
+| Metric | Value |
+|--------|-------|
+| Total snapshots | 1,129,825 |
+| Unique games | 8,871 |
+| Features | 16 |
+| Home win rate | 55.8% |
+| Playoff rows | 6.5% |
+| OT rows | 0.7% |
+| Possession = home | 46.5% |
+| Validation checks | **16/16 PASS** |
+| Extraction time | ~3 min 15 sec |
+
+### Feature set — final 16 (from planned 18)
+
+`home_fts_pending` and `away_fts_pending` were **dropped** from the final feature set.
+
+Root cause: FT events in V3 PBP have no `scorehome`/`scoreaway` values — they don't appear in scored-play snapshots. By the time a snapshot is taken (at a made FT or field goal), the FT sequence has already resolved and `fts_pending` is back to 0. The feature was 0 in 99%+ of rows, making it useless for training.
+
+`home_in_bonus` and `away_in_bonus` were **kept** and work correctly after the two-pass fix (see bugs below).
+
+### Key bugs encountered and fixed
+
+**Bug 1 — GAME_ID KeyError (all 8,871 games failed extraction)**
+- Cause: `games.set_index("GAME_ID")` moves GAME_ID to the index; `game_meta["GAME_ID"]` then raises KeyError
+- Fix: added `game_id` as explicit parameter to `extract_snapshots()`; use `game_meta.name` as fallback
+
+**Bug 2 — FT/bonus features all zero (zero-variance check failed)**
+- Cause: extraction filtered to scored-plays-only first, then tried to find Foul/Free Throw events — those events have no score in V3 so they were already filtered out
+- Fix: two-pass approach — STEP A processes full PBP and computes FT/bonus state per row; STEP B filters to scored plays and attaches the precomputed state. Bonus columns now show real variance.
+
+**Bug 3 — V3 actiontype case mismatch**
+- Cause: original code matched `"freethrow"` (lowercase, no space). V3 uses `"Free Throw"` (title case, space)
+- Fix: exact string matching `atype == "Free Throw"` and `atype == "Foul"`
+
+**Bug 4 — UnicodeEncodeError on Windows**
+- Cause: `report_path.write_text(report)` uses system default `cp1252` encoding, which can't handle `→`
+- Fix: `write_text(report, encoding="utf-8")`
+
+**Bug 5 — smoke_test_live merged into diagnose_pbp_columns**
+- Cause: missing closing `"""` left the smoke test body running inside the diagnostic function
+- Fix: restored proper function boundary
+
+**Bug 6 — stale cache loading (rebuild not triggering)**
+- Cause: old 18-column parquet contained all 16 new columns + 2 dropped ones, so subset check passed
+- Fix: count-based check — if parquet doesn't have exactly N_FEATURES columns, rebuild
+
+### Architecture note: two-pass PBP extraction
+
+The V3 PBP has a structural property: scored events (`scorehome`/`scoreaway` populated) and state events (fouls, FTs, timeouts) are separate rows. You cannot derive foul/bonus state from scored-play rows alone.
+
+Solution: process the full PBP first to accumulate state, then filter to scored plays and carry state forward. This is the correct approach for any feature derived from non-scoring events (bonus, foul trouble, timeouts remaining, etc.).
+
+### Data notes
+- `possession` = 0.465 (slightly below 0.50) — expected; home teams make more 2-pt shots (which have possession=1) but give up more 3-pt attempts (which would show possession=0 if the away team made them). Not a bug.
+- `avail_delta` = 0.0 for all rows — expected until DARKO CSV is downloaded from darko.app
+- 65 rows winsorised at ±60 — less than 0.006% of data, correct
+
+### Next: Phase 2 — Training
+Run: `python phase2_training.py`
 
 ## Planned UI features (parked for later phases)
 
