@@ -1,4 +1,4 @@
-## Phase 1 — Data Pipeline (2026-09-29 06:22 UTC)
+## Phase 1 — Data Pipeline (2026-09-29 06:28 UTC)
 
 - Seasons: 2018-19 → 2024-25
 - Total snapshots: 1,129,825
@@ -9,4 +9,4 @@
 - OT rows: 0.7%
 - Possession=home: 0.465
 - Saved to: data\processed\features_v3.parquet
-- Validation: FAIL
+- Validation: PASS
